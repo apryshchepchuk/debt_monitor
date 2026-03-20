@@ -1,7 +1,6 @@
 import csv
 import io
 import json
-import sys
 import zipfile
 from pathlib import Path
 from urllib.request import urlopen, Request
@@ -9,17 +8,31 @@ from urllib.request import urlopen, Request
 
 ROWS_TO_READ = 30
 ENCODINGS_TO_TRY = ["utf-8-sig", "utf-8", "cp1251", "cp1252"]
-DEFAULT_URL = "https://data.gov.ua/dataset/783b9b50-faba-4cc9-a393-60485e395b1d/resource/e6ea76c1-01f4-4bd0-a282-7d92d6ecc2a1/download/29-ex_csv_erb.zip"
+
+SOURCES = [
+    {
+        "name": "erb",
+        "url": "https://data.gov.ua/dataset/783b9b50-faba-4cc9-a393-60485e395b1d/resource/e6ea76c1-01f4-4bd0-a282-7d92d6ecc2a1/download/29-ex_csv_erb.zip",
+    },
+    {
+        "name": "asvp",
+        "url": "https://data.gov.ua/dataset/22aef563-3e87-4ed9-92e8-d764dc02f426/resource/d1a38c08-0f3a-4687-866f-f28f50df7c46/download/28-ex_csv_asvp.zip",
+    },
+]
 
 
 def detect_delimiter(sample_text: str) -> str:
-    candidates = [",", ";", "\t", "|"]
+    first_lines = "\n".join(sample_text.splitlines()[:5])
+
+    for delim in [";", ",", "\t", "|"]:
+        if first_lines.count(delim) >= 3:
+            return delim
+
     try:
-        dialect = csv.Sniffer().sniff(sample_text, delimiters="".join(candidates))
+        dialect = csv.Sniffer().sniff(first_lines, delimiters=";,|\t")
         return dialect.delimiter
     except Exception:
-        counts = {d: sample_text.count(d) for d in candidates}
-        return max(counts, key=counts.get)
+        return ";"
 
 
 def decode_bytes(raw_bytes: bytes):
@@ -58,10 +71,15 @@ def read_preview_from_csv_bytes(raw_bytes: bytes, source_name: str):
 
     delimiter = detect_delimiter(sample)
     reader = csv.reader(text_stream, delimiter=delimiter)
-
     header = next(reader, [])
-    rows = []
 
+    if len(header) == 1 and ";" in header[0] and delimiter != ";":
+        text_stream.seek(0)
+        delimiter = ";"
+        reader = csv.reader(text_stream, delimiter=delimiter)
+        header = next(reader, [])
+
+    rows = []
     for i, row in enumerate(reader, start=1):
         rows.append(row)
         if i >= ROWS_TO_READ:
@@ -93,8 +111,9 @@ def process_zip(zip_path: Path):
         return result
 
 
-def save_outputs(result: dict):
-    print("\n=== META ===")
+def save_outputs(dataset_name: str, result: dict):
+    print(f"\n========== {dataset_name.upper()} ==========")
+    print("=== META ===")
     print(f"container: {result['container']}")
     print(f"source_name: {result['source_name']}")
     print(f"encoding: {result['encoding']}")
@@ -112,6 +131,7 @@ def save_outputs(result: dict):
             print(f"  {j:02d}. {col_name}: {value}")
 
     out_json = {
+        "dataset_name": dataset_name,
         "container": result["container"],
         "source_name": result["source_name"],
         "encoding": result["encoding"],
@@ -121,30 +141,35 @@ def save_outputs(result: dict):
         "zip_csv_candidates": result.get("zip_csv_candidates", []),
     }
 
-    with open("peek_result.json", "w", encoding="utf-8") as f:
+    json_name = f"peek_result_{dataset_name}.json"
+    csv_name = f"peek_sample_{dataset_name}.csv"
+
+    with open(json_name, "w", encoding="utf-8") as f:
         json.dump(out_json, f, ensure_ascii=False, indent=2)
 
-    with open("peek_sample.csv", "w", encoding="utf-8", newline="") as f:
+    with open(csv_name, "w", encoding="utf-8", newline="") as f:
         writer = csv.writer(f, delimiter=result["delimiter"])
         if result["header"]:
             writer.writerow(result["header"])
         writer.writerows(result["rows"])
 
     print("\nСтворено файли:")
-    print("- peek_result.json")
-    print("- peek_sample.csv")
+    print(f"- {json_name}")
+    print(f"- {csv_name}")
 
 
 def main():
-    url = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_URL
+    for source in SOURCES:
+        dataset_name = source["name"]
+        url = source["url"]
+        download_path = Path(f"{dataset_name}.zip")
 
-    download_path = Path("source.zip")
-    print(f"Завантаження: {url}")
-    fetch_to_file(url, download_path)
-    print(f"Файл завантажено: {download_path}")
+        print(f"\nЗавантаження [{dataset_name}]: {url}")
+        fetch_to_file(url, download_path)
+        print(f"Файл завантажено: {download_path}")
 
-    result = process_zip(download_path)
-    save_outputs(result)
+        result = process_zip(download_path)
+        save_outputs(dataset_name, result)
 
 
 if __name__ == "__main__":
