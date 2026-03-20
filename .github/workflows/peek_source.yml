@@ -1,4 +1,4 @@
-name: Peek source
+name: Peek sources
 
 on:
   workflow_dispatch:
@@ -16,7 +16,7 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run source check
+      - name: Run source checks
         run: |
           python peek_csv.py
 
@@ -25,5 +25,7 @@ jobs:
         with:
           name: peek-output
           path: |
-            peek_result.json
-            peek_sample.csv
+            peek_result_erb.json
+            peek_sample_erb.csv
+            peek_result_asvp.json
+            peek_sample_asvp.csv
