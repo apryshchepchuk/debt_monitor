@@ -21,20 +21,6 @@ SOURCES = [
 ]
 
 
-def detect_delimiter(sample_text: str) -> str:
-    first_lines = "\n".join(sample_text.splitlines()[:5])
-
-    for delim in [";", ",", "\t", "|"]:
-        if first_lines.count(delim) >= 3:
-            return delim
-
-    try:
-        dialect = csv.Sniffer().sniff(first_lines, delimiters=";,|\t")
-        return dialect.delimiter
-    except Exception:
-        return ";"
-
-
 def decode_bytes(raw_bytes: bytes):
     last_error = None
     for enc in ENCODINGS_TO_TRY:
@@ -62,35 +48,87 @@ def fetch_to_file(url: str, target_path: Path) -> Path:
     return target_path
 
 
-def read_preview_from_csv_bytes(raw_bytes: bytes, source_name: str):
-    text, encoding_used = decode_bytes(raw_bytes)
+def parse_with_delimiter(text: str, delimiter: str):
     text_stream = io.StringIO(text)
-
-    sample = text_stream.read(10000)
-    text_stream.seek(0)
-
-    delimiter = detect_delimiter(sample)
     reader = csv.reader(text_stream, delimiter=delimiter)
+
     header = next(reader, [])
-
-    if len(header) == 1 and ";" in header[0] and delimiter != ";":
-        text_stream.seek(0)
-        delimiter = ";"
-        reader = csv.reader(text_stream, delimiter=delimiter)
-        header = next(reader, [])
-
     rows = []
+
     for i, row in enumerate(reader, start=1):
         rows.append(row)
         if i >= ROWS_TO_READ:
             break
 
+    return header, rows
+
+
+def score_parse(header, rows):
+    score = 0
+
+    if len(header) > 1:
+        score += len(header) * 10
+
+    if rows:
+        row_lengths = [len(r) for r in rows[:10]]
+        avg_cols = sum(row_lengths) / len(row_lengths)
+        score += avg_cols * 5
+
+        # бонус за стабільну кількість колонок у рядках
+        most_common_len = max(set(row_lengths), key=row_lengths.count)
+        stable_count = sum(1 for x in row_lengths if x == most_common_len)
+        score += stable_count * 3
+
+        # бонус, якщо header і рядки мають подібну кількість колонок
+        if len(header) == most_common_len:
+            score += 20
+
+    # штраф, якщо все злиплося в 1 колонку
+    if len(header) == 1:
+        score -= 50
+
+    return score
+
+
+def detect_best_delimiter(text: str):
+    candidates = [";", ",", "\t", "|"]
+    best = None
+
+    for delim in candidates:
+        try:
+            header, rows = parse_with_delimiter(text, delim)
+            score = score_parse(header, rows)
+
+            candidate_result = {
+                "delimiter": delim,
+                "header": header,
+                "rows": rows,
+                "score": score,
+            }
+
+            if best is None or candidate_result["score"] > best["score"]:
+                best = candidate_result
+
+        except Exception:
+            continue
+
+    if best is None:
+        raise RuntimeError("Не вдалося визначити роздільник CSV.")
+
+    return best
+
+
+def read_preview_from_csv_bytes(raw_bytes: bytes, source_name: str):
+    text, encoding_used = decode_bytes(raw_bytes)
+
+    best = detect_best_delimiter(text)
+
     return {
         "source_name": source_name,
         "encoding": encoding_used,
-        "delimiter": delimiter,
-        "header": header,
-        "rows": rows,
+        "delimiter": best["delimiter"],
+        "header": best["header"],
+        "rows": best["rows"],
     }
 
 
@@ -118,6 +156,7 @@ def save_outputs(dataset_name: str, result: dict):
     print(f"source_name: {result['source_name']}")
     print(f"encoding: {result['encoding']}")
     print(f"delimiter: {repr(result['delimiter'])}")
+    print(f"columns_count: {len(result['header'])}")
 
     print("\n=== HEADER ===")
     for idx, col in enumerate(result["header"], start=1):
@@ -136,6 +175,7 @@ def save_outputs(dataset_name: str, result: dict):
         "source_name": result["source_name"],
         "encoding": result["encoding"],
         "delimiter": result["delimiter"],
+        "columns_count": len(result["header"]),
         "header": result["header"],
         "rows": result["rows"],
         "zip_csv_candidates": result.get("zip_csv_candidates", []),
