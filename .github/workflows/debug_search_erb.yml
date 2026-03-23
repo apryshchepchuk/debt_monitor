@@ -1,10 +1,10 @@
-name: Debug ERB by current watchlist
+name: Debug ERB codes
 
 on:
   workflow_dispatch:
 
 jobs:
-  debug-erb-watchlist:
+  debug-erb-codes:
     runs-on: ubuntu-latest
 
     steps:
@@ -23,14 +23,14 @@ jobs:
         run: |
           python get_watchlist.py
 
-      - name: Run ERB watchlist debug
+      - name: Run ERB code debug
         run: |
-          python debug_search_erb.py
+          python debug_codes_erb.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: debug-erb-watchlist-output
+          name: debug-erb-codes-output
           path: |
-            debug_erb_watchlist.json
+            debug_erb_codes.json
             watchlist.json
