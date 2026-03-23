@@ -1,0 +1,24 @@
+name: Push test to Google Sheets
+
+on:
+  workflow_dispatch:
+
+jobs:
+  push-test:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run push test
+        env:
+          GSHEET_WEBAPP_URL: ${{ secrets.GSHEET_WEBAPP_URL }}
+          GSHEET_API_TOKEN: ${{ secrets.GSHEET_API_TOKEN }}
+        run: |
+          python push_test.py
