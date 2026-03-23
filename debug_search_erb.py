@@ -10,29 +10,67 @@ from urllib.request import urlopen, Request
 
 ERB_DATAPACKAGE_URL = "https://data.gov.ua/dataset/506734bf-2480-448c-a2b4-90b6d06df11e/datapackage"
 ERB_ZIP_PATH = Path("erb_debug.zip")
+WATCHLIST_PATH = Path("watchlist.json")
 
 ENCODINGS_TO_TRY = ["utf-8-sig", "utf-8", "cp1251", "cp1252"]
-
-# Налаштуй тут свої пошукові параметри
-SEARCH_CODES = [
-    "31117042",
-]
-
-SEARCH_NAME_PARTS = [
-    "САНА",
-    "САНА КО",
-]
 
 
 def normalize_text(value: str) -> str:
     value = str(value or "").strip().upper()
     value = value.replace("’", "'").replace("`", "'").replace("Ё", "Е")
+    value = value.replace('"', "")
+    value = value.replace("«", "").replace("»", "")
+    value = value.replace("-", " ")
     value = re.sub(r"\s+", " ", value)
-    return value
+    return value.strip()
 
 
 def normalize_code(value: str) -> str:
     return re.sub(r"\D+", "", str(value or ""))
+
+
+def normalize_birthdate(value: str) -> str:
+    value = str(value or "").strip()
+    if not value:
+        return ""
+    match = re.match(r"^(\d{2}\.\d{2}\.\d{4})", value)
+    return match.group(1) if match else value
+
+
+def truthy(value) -> bool:
+    return str(value).strip().lower() in {"true", "1", "yes", "y"}
+
+
+def short_name_variants(name: str) -> set[str]:
+    """
+    Дає кілька грубих нормалізованих варіантів назви юрособи
+    для дебагу, а не для фінального продакшен-матчингу.
+    """
+    n = normalize_text(name)
+    variants = {n}
+
+    replacements = [
+        ("ПРИВАТНЕ ПІДПРИЄМСТВО", "ПП"),
+        ("ТОВАРИСТВО З ОБМЕЖЕНОЮ ВІДПОВІДАЛЬНІСТЮ", "ТОВ"),
+        ("АКЦІОНЕРНЕ ТОВАРИСТВО", "АТ"),
+        ("ПУБЛІЧНЕ АКЦІОНЕРНЕ ТОВАРИСТВО", "ПАТ"),
+        ("ПРИВАТНЕ АКЦІОНЕРНЕ ТОВАРИСТВО", "ПрАТ".upper()),
+    ]
+
+    for src, dst in replacements:
+        if src in n:
+            variants.add(n.replace(src, dst))
+
+    # варіант без оргформи
+    no_prefix = re.sub(
+        r"^(ПРИВАТНЕ ПІДПРИЄМСТВО|ПП|ТОВАРИСТВО З ОБМЕЖЕНОЮ ВІДПОВІДАЛЬНІСТЮ|ТОВ|АКЦІОНЕРНЕ ТОВАРИСТВО|АТ|ПУБЛІЧНЕ АКЦІОНЕРНЕ ТОВАРИСТВО|ПАТ|ПРИВАТНЕ АКЦІОНЕРНЕ ТОВАРИСТВО|ПРАТ)\s+",
+        "",
+        n,
+    ).strip()
+    if no_prefix:
+        variants.add(no_prefix)
+
+    return {v for v in variants if v}
 
 
 def fetch_text(url: str, retries: int = 4, timeout: int = 90) -> str:
@@ -197,9 +235,57 @@ def iter_csv_rows_from_zip(zip_path: Path, encoding: str, delimiter: str, csv_na
                 yield {str(k): ("" if v is None else str(v)) for k, v in row.items()}
 
 
+def load_watchlist(path: Path):
+    with open(path, "r", encoding="utf-8") as f:
+        rows = json.load(f)
+
+    prepared = []
+    for row in rows:
+        entity_type = str(row.get("entity_type", "")).strip().lower()
+        debtor_name = str(row.get("debtor_name", "")).strip()
+
+        prepared.append({
+            "id": str(row.get("id", "")).strip(),
+            "is_active": truthy(row.get("is_active", "")),
+            "entity_type": entity_type,
+            "label": str(row.get("label", "")).strip(),
+            "debtor_name": debtor_name,
+            "debtor_name_norm": normalize_text(debtor_name),
+            "debtor_name_variants": sorted(short_name_variants(debtor_name)),
+            "debtor_code": normalize_code(row.get("debtor_code", "")),
+            "birthdate": normalize_birthdate(row.get("birthdate", "")),
+            "notes": str(row.get("notes", "")).strip(),
+        })
+
+    active = [r for r in prepared if r["is_active"]]
+    print(f"Loaded watchlist rows: {len(active)} active")
+    return active
+
+
+def row_brief(row: dict) -> dict:
+    return {
+        "DEBTOR_NAME": row.get("DEBTOR_NAME", ""),
+        "DEBTOR_BIRTHDATE": row.get("DEBTOR_BIRTHDATE", ""),
+        "DEBTOR_CODE": row.get("DEBTOR_CODE", ""),
+        "PUBLISHER": row.get("PUBLISHER", ""),
+        "ORG_NAME": row.get("ORG_NAME", ""),
+        "VP_ORDERNUM": row.get("VP_ORDERNUM", ""),
+        "VD_CAT": row.get("VD_CAT", ""),
+    }
+
+
+def append_limited(bucket: list, item: dict, limit: int = 100):
+    if len(bucket) < limit:
+        bucket.append(item)
+
+
 def main():
-    search_codes = {normalize_code(x) for x in SEARCH_CODES if str(x).strip()}
-    search_name_parts = [normalize_text(x) for x in SEARCH_NAME_PARTS if str(x).strip()]
+    if not WATCHLIST_PATH.exists():
+        raise FileNotFoundError("Не знайдено watchlist.json. Спочатку запусти workflow отримання watchlist.")
+
+    watchlist = load_watchlist(WATCHLIST_PATH)
+    if not watchlist:
+        raise RuntimeError("Watchlist порожній або немає активних записів.")
 
     print("Resolving datapackage for ERB...")
     erb_resource = resolve_resource_from_datapackage(ERB_DATAPACKAGE_URL)
@@ -215,8 +301,34 @@ def main():
         f"delimiter={meta['delimiter']}, encoding={meta['encoding']}"
     )
 
-    matches = []
-    scanned = 0
+    results = {
+        "resource_name": erb_resource["resource_name"],
+        "resource_path": erb_resource["resource_path"],
+        "csv_name": meta["csv_name"],
+        "delimiter": meta["delimiter"],
+        "encoding": meta["encoding"],
+        "scanned_rows": 0,
+        "watchlist_debug": [],
+    }
+
+    debug_map = {}
+    for w in watchlist:
+        debug_map[w["id"]] = {
+            "watchlist_id": w["id"],
+            "label": w["label"],
+            "entity_type": w["entity_type"],
+            "debtor_name": w["debtor_name"],
+            "debtor_name_norm": w["debtor_name_norm"],
+            "debtor_name_variants": w["debtor_name_variants"],
+            "debtor_code": w["debtor_code"],
+            "birthdate": w["birthdate"],
+            "strong_code_matches_count": 0,
+            "exact_name_matches_count": 0,
+            "partial_name_matches_count": 0,
+            "strong_code_matches_sample": [],
+            "exact_name_matches_sample": [],
+            "partial_name_matches_sample": [],
+        }
 
     for row in iter_csv_rows_from_zip(
         zip_path=ERB_ZIP_PATH,
@@ -224,56 +336,76 @@ def main():
         delimiter=meta["delimiter"],
         csv_name=meta["csv_name"],
     ):
-        scanned += 1
+        results["scanned_rows"] += 1
 
-        debtor_name_raw = row.get("DEBTOR_NAME", "")
-        debtor_name_norm = normalize_text(debtor_name_raw)
-        debtor_code_norm = normalize_code(row.get("DEBTOR_CODE", ""))
+        row_name_norm = normalize_text(row.get("DEBTOR_NAME", ""))
+        row_code_norm = normalize_code(row.get("DEBTOR_CODE", ""))
+        row_birthdate = normalize_birthdate(row.get("DEBTOR_BIRTHDATE", ""))
 
-        matched_by = []
+        for w in watchlist:
+            dbg = debug_map[w["id"]]
 
-        if debtor_code_norm and debtor_code_norm in search_codes:
-            matched_by.append("code")
+            # 1. strong code match
+            if w["entity_type"] == "company" and w["debtor_code"] and row_code_norm and w["debtor_code"] == row_code_norm:
+                dbg["strong_code_matches_count"] += 1
+                append_limited(
+                    dbg["strong_code_matches_sample"],
+                    {
+                        "matched_by": "code",
+                        **row_brief(row),
+                    },
+                )
 
-        for part in search_name_parts:
-            if part and part in debtor_name_norm:
-                matched_by.append(f"name_part:{part}")
+            # 2. exact name match
+            if w["debtor_name_norm"] and row_name_norm == w["debtor_name_norm"]:
+                dbg["exact_name_matches_count"] += 1
+                append_limited(
+                    dbg["exact_name_matches_sample"],
+                    {
+                        "matched_by": "exact_name",
+                        **row_brief(row),
+                    },
+                )
 
-        if matched_by:
-            matches.append({
-                "matched_by": matched_by,
-                "DEBTOR_NAME": row.get("DEBTOR_NAME", ""),
-                "DEBTOR_BIRTHDATE": row.get("DEBTOR_BIRTHDATE", ""),
-                "DEBTOR_CODE": row.get("DEBTOR_CODE", ""),
-                "PUBLISHER": row.get("PUBLISHER", ""),
-                "ORG_NAME": row.get("ORG_NAME", ""),
-                "ORG_PHONE_NUM": row.get("ORG_PHONE_NUM", ""),
-                "EMP_FULL_FIO": row.get("EMP_FULL_FIO", ""),
-                "EMP_PHONE_NUM": row.get("EMP_PHONE_NUM", ""),
-                "EMAIL_ADDR": row.get("EMAIL_ADDR", ""),
-                "VP_ORDERNUM": row.get("VP_ORDERNUM", ""),
-                "VD_CAT": row.get("VD_CAT", ""),
-            })
+            # 3. partial name match
+            partial_hit = False
+            for variant in w["debtor_name_variants"]:
+                if not variant:
+                    continue
 
-    out = {
-        "scanned_rows": scanned,
-        "matches_found": len(matches),
-        "search_codes": sorted(search_codes),
-        "search_name_parts": search_name_parts,
-        "resource_name": erb_resource["resource_name"],
-        "resource_path": erb_resource["resource_path"],
-        "csv_name": meta["csv_name"],
-        "delimiter": meta["delimiter"],
-        "encoding": meta["encoding"],
-        "matches": matches,
-    }
+                if len(variant) >= 6 and (variant in row_name_norm or row_name_norm in variant):
+                    partial_hit = True
+                    break
 
-    with open("debug_erb_matches.json", "w", encoding="utf-8") as f:
-        json.dump(out, f, ensure_ascii=False, indent=2)
+            # для фізосіб не засмічуємо partial надто широко
+            if w["entity_type"] == "person" and len(w["debtor_name_norm"]) < 10:
+                partial_hit = False
 
-    print(f"Scanned rows: {scanned}")
-    print(f"Matches found: {len(matches)}")
-    print("Saved debug_erb_matches.json")
+            if partial_hit and row_name_norm != w["debtor_name_norm"]:
+                dbg["partial_name_matches_count"] += 1
+                append_limited(
+                    dbg["partial_name_matches_sample"],
+                    {
+                        "matched_by": "partial_name",
+                        **row_brief(row),
+                    },
+                )
+
+    results["watchlist_debug"] = list(debug_map.values())
+
+    with open("debug_erb_watchlist.json", "w", encoding="utf-8") as f:
+        json.dump(results, f, ensure_ascii=False, indent=2)
+
+    print(f"Scanned rows: {results['scanned_rows']}")
+    print("Saved debug_erb_watchlist.json")
+
+    for item in results["watchlist_debug"]:
+        print(
+            f"[{item['watchlist_id']}] {item['label']} | "
+            f"code={item['strong_code_matches_count']} | "
+            f"exact_name={item['exact_name_matches_count']} | "
+            f"partial_name={item['partial_name_matches_count']}"
+        )
 
 
 if __name__ == "__main__":
