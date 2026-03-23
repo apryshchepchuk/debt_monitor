@@ -9,8 +9,8 @@ from pathlib import Path
 from urllib.request import urlopen, Request
 
 
-ERB_DATAPACKAGE_URL = "https://data.gov.ua/dataset/506734bf-2480-448c-a2b4-90b6d06df11e/datapackage"
-ASVP_DATAPACKAGE_URL = "https://data.gov.ua/dataset/6c0eb6c0-d19a-4bb0-869b-3280df46800a/datapackage"
+ERB_DATAPACKAGE_URL = "https://data.gov.ua/dataset/506734bf-2480-448c-a2b4-90b6d06df11e/datapackage.json"
+ASVP_DATAPACKAGE_URL = "https://data.gov.ua/dataset/6c0eb6c0-d19a-4bb0-869b-3280df46800a/datapackage.json"
 
 WATCHLIST_PATH = Path("watchlist.json")
 ENCODINGS_TO_TRY = ["utf-8-sig", "utf-8", "cp1251", "cp1252"]
