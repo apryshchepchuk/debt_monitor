@@ -4,12 +4,13 @@ import json
 import re
 import zipfile
 import hashlib
+import time
 from pathlib import Path
 from urllib.request import urlopen, Request
 
 
-ERB_URL = "https://data.gov.ua/dataset/783b9b50-faba-4cc9-a393-60485e395b1d/resource/e6ea76c1-01f4-4bd0-a282-7d92d6ecc2a1/download/29-ex_csv_erb.zip"
-ASVP_URL = "https://data.gov.ua/dataset/22aef563-3e87-4ed9-92e8-d764dc02f426/resource/d1a38c08-0f3a-4687-866f-f28f50df7c46/download/28-ex_csv_asvp.zip"
+ERB_DATAPACKAGE_URL = "https://data.gov.ua/dataset/506734bf-2480-448c-a2b4-90b6d06df11e/datapackage"
+ASVP_DATAPACKAGE_URL = "https://data.gov.ua/dataset/6c0eb6c0-d19a-4bb0-869b-3280df46800a/datapackage"
 
 WATCHLIST_PATH = Path("watchlist.json")
 ENCODINGS_TO_TRY = ["utf-8-sig", "utf-8", "cp1251", "cp1252"]
@@ -30,7 +31,6 @@ def normalize_birthdate(value: str) -> str:
     value = str(value or "").strip()
     if not value:
         return ""
-    # беремо тільки dd.mm.yyyy, якщо там є час
     m = re.match(r"^(\d{2}\.\d{2}\.\d{4})", value)
     return m.group(1) if m else value
 
@@ -39,21 +39,92 @@ def truthy(value) -> bool:
     return str(value).strip().lower() in {"true", "1", "yes", "y"}
 
 
-def fetch_to_file(url: str, target_path: Path) -> Path:
-    req = Request(
-        url,
-        headers={
-            "User-Agent": "Mozilla/5.0",
-            "Accept": "*/*",
-        },
-    )
-    with urlopen(req) as response, open(target_path, "wb") as out:
-        while True:
-            chunk = response.read(1024 * 1024)
-            if not chunk:
-                break
-            out.write(chunk)
-    return target_path
+def fetch_text(url: str, retries: int = 3) -> str:
+    last_error = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            req = Request(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "*/*",
+                },
+            )
+            with urlopen(req, timeout=120) as response:
+                return response.read().decode("utf-8")
+        except Exception as e:
+            last_error = e
+            if attempt < retries:
+                time.sleep(3 * attempt)
+
+    raise RuntimeError(f"Не вдалося завантажити текст із {url}: {last_error}")
+
+
+def fetch_to_file(url: str, target_path: Path, retries: int = 3) -> Path:
+    last_error = None
+
+    for attempt in range(1, retries + 1):
+        try:
+            req = Request(
+                url,
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "*/*",
+                },
+            )
+            with urlopen(req, timeout=300) as response, open(target_path, "wb") as out:
+                while True:
+                    chunk = response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    out.write(chunk)
+
+            if target_path.suffix.lower() == ".zip":
+                with zipfile.ZipFile(target_path, "r") as zf:
+                    bad_member = zf.testzip()
+                    if bad_member is not None:
+                        raise zipfile.BadZipFile(f"CRC failed for member: {bad_member}")
+
+            return target_path
+
+        except Exception as e:
+            last_error = e
+            if target_path.exists():
+                target_path.unlink(missing_ok=True)
+            if attempt < retries:
+                time.sleep(5 * attempt)
+
+    raise RuntimeError(f"Не вдалося коректно завантажити файл {url}: {last_error}")
+
+
+def resolve_resource_from_datapackage(datapackage_url: str) -> dict:
+    raw = fetch_text(datapackage_url)
+    data = json.loads(raw)
+
+    resources = data.get("resources", [])
+    if not resources:
+        raise RuntimeError(f"У datapackage немає resources: {datapackage_url}")
+
+    zip_resources = [
+        r for r in resources
+        if str(r.get("format", "")).upper() == "ZIP" or str(r.get("path", "")).lower().endswith(".zip")
+    ]
+    if not zip_resources:
+        raise RuntimeError(f"У datapackage немає ZIP-ресурсу: {datapackage_url}")
+
+    resource = zip_resources[0]
+    path = resource.get("path", "")
+    name = resource.get("name", "")
+
+    if not path:
+        raise RuntimeError(f"У ресурсі немає path: {datapackage_url}")
+
+    return {
+        "dataset_title": data.get("title", ""),
+        "resource_name": name,
+        "resource_path": path,
+    }
 
 
 def decode_bytes(raw_bytes: bytes):
@@ -159,7 +230,6 @@ def match_watchlist(row: dict, watchlist: list):
                 matches.append((w, "strong"))
                 continue
 
-            # слабкий запасний варіант по назві
             if not w["debtor_code"] and w["debtor_name_norm"] and w["debtor_name_norm"] == row_name:
                 matches.append((w, "weak"))
 
@@ -241,7 +311,7 @@ def dedupe_records(records: list):
     return result
 
 
-def process_source(zip_path: Path, source_name: str, watchlist: list, source_date: str):
+def process_source(zip_path: Path, source_name: str, watchlist: list, source_date: str, resource_meta: dict):
     meta = parse_header_and_delimiter_from_zip(zip_path)
     matches = []
     scanned = 0
@@ -270,7 +340,13 @@ def process_source(zip_path: Path, source_name: str, watchlist: list, source_dat
         "status": "ok",
         "rows_scanned": str(scanned),
         "matches_found": str(len(matches)),
-        "notes": f"delimiter={meta['delimiter']}; encoding={meta['encoding']}; csv_name={meta['csv_name']}",
+        "notes": (
+            f"dataset_title={resource_meta['dataset_title']}; "
+            f"resource_name={resource_meta['resource_name']}; "
+            f"delimiter={meta['delimiter']}; "
+            f"encoding={meta['encoding']}; "
+            f"csv_name={meta['csv_name']}"
+        ),
     }
 
     return matches, tech_row
@@ -284,23 +360,30 @@ def main():
     if not watchlist:
         raise RuntimeError("Watchlist порожній або немає активних записів.")
 
-    source_date = Path(".").resolve().name  # запасний технічний варіант
     source_date = __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    print("Resolving datapackage for ERB...")
+    erb_resource = resolve_resource_from_datapackage(ERB_DATAPACKAGE_URL)
+    print(f"ERB resource: {erb_resource['resource_name']}")
+
+    print("Resolving datapackage for ASVP...")
+    asvp_resource = resolve_resource_from_datapackage(ASVP_DATAPACKAGE_URL)
+    print(f"ASVP resource: {asvp_resource['resource_name']}")
 
     erb_zip = Path("erb.zip")
     asvp_zip = Path("asvp.zip")
 
-    print("Downloading ERB...")
-    fetch_to_file(ERB_URL, erb_zip)
+    print("Downloading ERB ZIP...")
+    fetch_to_file(erb_resource["resource_path"], erb_zip)
 
-    print("Downloading ASVP...")
-    fetch_to_file(ASVP_URL, asvp_zip)
+    print("Downloading ASVP ZIP...")
+    fetch_to_file(asvp_resource["resource_path"], asvp_zip)
 
     print("Filtering ERB...")
-    erb_rows, erb_tech = process_source(erb_zip, "erb", watchlist, source_date)
+    erb_rows, erb_tech = process_source(erb_zip, "erb", watchlist, source_date, erb_resource)
 
     print("Filtering ASVP...")
-    asvp_rows, asvp_tech = process_source(asvp_zip, "asvp", watchlist, source_date)
+    asvp_rows, asvp_tech = process_source(asvp_zip, "asvp", watchlist, source_date, asvp_resource)
 
     with open("filtered_erb.json", "w", encoding="utf-8") as f:
         json.dump(erb_rows, f, ensure_ascii=False, indent=2)
