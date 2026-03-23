@@ -1,0 +1,38 @@
+name: Filter ERB and ASVP by watchlist
+
+on:
+  workflow_dispatch:
+
+jobs:
+  filter:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Fetch watchlist
+        env:
+          GSHEET_WEBAPP_URL: ${{ secrets.GSHEET_WEBAPP_URL }}
+          GSHEET_API_TOKEN: ${{ secrets.GSHEET_API_TOKEN }}
+        run: |
+          python get_watchlist.py
+
+      - name: Filter sources
+        run: |
+          python filter_sources.py
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: filtered-output
+          path: |
+            filtered_erb.json
+            filtered_asvp.json
+            tech_rows.json
+            watchlist.json
