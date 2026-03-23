@@ -5,14 +5,18 @@ import re
 import zipfile
 import hashlib
 import time
+from datetime import datetime
 from pathlib import Path
 from urllib.request import urlopen, Request
 
 
-ERB_DATAPACKAGE_URL = "https://data.gov.ua/dataset/506734bf-2480-448c-a2b4-90b6d06df11e/datapackage.json"
-ASVP_DATAPACKAGE_URL = "https://data.gov.ua/dataset/6c0eb6c0-d19a-4bb0-869b-3280df46800a/datapackage.json"
+ERB_DATAPACKAGE_URL = "https://data.gov.ua/dataset/506734bf-2480-448c-a2b4-90b6d06df11e/datapackage"
+ASVP_DATAPACKAGE_URL = "https://data.gov.ua/dataset/6c0eb6c0-d19a-4bb0-869b-3280df46800a/datapackage"
 
 WATCHLIST_PATH = Path("watchlist.json")
+ERB_ZIP_PATH = Path("erb.zip")
+ASVP_ZIP_PATH = Path("asvp.zip")
+
 ENCODINGS_TO_TRY = ["utf-8-sig", "utf-8", "cp1251", "cp1252"]
 
 
@@ -31,49 +35,55 @@ def normalize_birthdate(value: str) -> str:
     value = str(value or "").strip()
     if not value:
         return ""
-    m = re.match(r"^(\d{2}\.\d{2}\.\d{4})", value)
-    return m.group(1) if m else value
+    match = re.match(r"^(\d{2}\.\d{2}\.\d{4})", value)
+    return match.group(1) if match else value
 
 
 def truthy(value) -> bool:
     return str(value).strip().lower() in {"true", "1", "yes", "y"}
 
 
-def fetch_text(url: str, retries: int = 3) -> str:
+def fetch_text(url: str, retries: int = 4, timeout: int = 90) -> str:
     last_error = None
 
     for attempt in range(1, retries + 1):
         try:
+            print(f"Fetching text (attempt {attempt}/{retries}): {url}")
             req = Request(
                 url,
                 headers={
                     "User-Agent": "Mozilla/5.0",
                     "Accept": "*/*",
+                    "Cache-Control": "no-cache",
                 },
             )
-            with urlopen(req, timeout=120) as response:
-                return response.read().decode("utf-8")
+            with urlopen(req, timeout=timeout) as response:
+                raw = response.read()
+                return raw.decode("utf-8")
         except Exception as e:
             last_error = e
+            print(f"Fetch failed: {e}")
             if attempt < retries:
-                time.sleep(3 * attempt)
+                time.sleep(5 * attempt)
 
     raise RuntimeError(f"Не вдалося завантажити текст із {url}: {last_error}")
 
 
-def fetch_to_file(url: str, target_path: Path, retries: int = 3) -> Path:
+def fetch_to_file(url: str, target_path: Path, retries: int = 3, timeout: int = 300) -> Path:
     last_error = None
 
     for attempt in range(1, retries + 1):
         try:
+            print(f"Downloading file (attempt {attempt}/{retries}): {url}")
             req = Request(
                 url,
                 headers={
                     "User-Agent": "Mozilla/5.0",
                     "Accept": "*/*",
+                    "Cache-Control": "no-cache",
                 },
             )
-            with urlopen(req, timeout=300) as response, open(target_path, "wb") as out:
+            with urlopen(req, timeout=timeout) as response, open(target_path, "wb") as out:
                 while True:
                     chunk = response.read(1024 * 1024)
                     if not chunk:
@@ -90,6 +100,7 @@ def fetch_to_file(url: str, target_path: Path, retries: int = 3) -> Path:
 
         except Exception as e:
             last_error = e
+            print(f"Download failed: {e}")
             if target_path.exists():
                 target_path.unlink(missing_ok=True)
             if attempt < retries:
@@ -165,11 +176,12 @@ def parse_header_and_delimiter_from_zip(zip_path: Path):
             if len(header) > 1:
                 score += len(header) * 10
             if rows:
-                lengths = [len(r) for r in rows]
-                common_len = max(set(lengths), key=lengths.count)
-                score += common_len * 5
-                if len(header) == common_len:
-                    score += 20
+                lengths = [len(r) for r in rows if r]
+                if lengths:
+                    common_len = max(set(lengths), key=lengths.count)
+                    score += common_len * 5
+                    if len(header) == common_len:
+                        score += 20
 
             if best is None or score > best["score"]:
                 best = {
@@ -214,7 +226,9 @@ def load_watchlist(path: Path):
             "notes": str(row.get("notes", "")).strip(),
         })
 
-    return [r for r in prepared if r["is_active"]]
+    active = [r for r in prepared if r["is_active"]]
+    print(f"Loaded watchlist rows: {len(active)} active")
+    return active
 
 
 def match_watchlist(row: dict, watchlist: list):
@@ -318,6 +332,11 @@ def process_source(zip_path: Path, source_name: str, watchlist: list, source_dat
 
     builder = build_erb_record if source_name == "erb" else build_asvp_record
 
+    print(
+        f"Processing {source_name.upper()}: "
+        f"csv_name={meta['csv_name']}, delimiter={meta['delimiter']}, encoding={meta['encoding']}"
+    )
+
     for row in iter_csv_rows_from_zip(
         zip_path=zip_path,
         encoding=meta["encoding"],
@@ -360,30 +379,29 @@ def main():
     if not watchlist:
         raise RuntimeError("Watchlist порожній або немає активних записів.")
 
-    source_date = __import__("datetime").datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    source_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     print("Resolving datapackage for ERB...")
     erb_resource = resolve_resource_from_datapackage(ERB_DATAPACKAGE_URL)
     print(f"ERB resource: {erb_resource['resource_name']}")
+    print(f"ERB ZIP URL: {erb_resource['resource_path']}")
 
     print("Resolving datapackage for ASVP...")
     asvp_resource = resolve_resource_from_datapackage(ASVP_DATAPACKAGE_URL)
     print(f"ASVP resource: {asvp_resource['resource_name']}")
-
-    erb_zip = Path("erb.zip")
-    asvp_zip = Path("asvp.zip")
+    print(f"ASVP ZIP URL: {asvp_resource['resource_path']}")
 
     print("Downloading ERB ZIP...")
-    fetch_to_file(erb_resource["resource_path"], erb_zip)
+    fetch_to_file(erb_resource["resource_path"], ERB_ZIP_PATH)
 
     print("Downloading ASVP ZIP...")
-    fetch_to_file(asvp_resource["resource_path"], asvp_zip)
+    fetch_to_file(asvp_resource["resource_path"], ASVP_ZIP_PATH)
 
     print("Filtering ERB...")
-    erb_rows, erb_tech = process_source(erb_zip, "erb", watchlist, source_date, erb_resource)
+    erb_rows, erb_tech = process_source(ERB_ZIP_PATH, "erb", watchlist, source_date, erb_resource)
 
     print("Filtering ASVP...")
-    asvp_rows, asvp_tech = process_source(asvp_zip, "asvp", watchlist, source_date, asvp_resource)
+    asvp_rows, asvp_tech = process_source(ASVP_ZIP_PATH, "asvp", watchlist, source_date, asvp_resource)
 
     with open("filtered_erb.json", "w", encoding="utf-8") as f:
         json.dump(erb_rows, f, ensure_ascii=False, indent=2)
