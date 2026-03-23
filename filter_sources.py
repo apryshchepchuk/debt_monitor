@@ -149,7 +149,7 @@ def decode_bytes(raw_bytes: bytes):
     raise RuntimeError(f"Не вдалося декодувати байти. Остання помилка: {last_error}")
 
 
-def parse_header_and_delimiter_from_zip(zip_path: Path):
+def parse_erb_layout_from_zip(zip_path: Path):
     with zipfile.ZipFile(zip_path, "r") as zf:
         csv_names = [n for n in zf.namelist() if n.lower().endswith(".csv")]
         if not csv_names:
@@ -158,95 +158,58 @@ def parse_header_and_delimiter_from_zip(zip_path: Path):
         csv_name = max(csv_names, key=lambda n: zf.getinfo(n).file_size)
 
         with zf.open(csv_name) as f:
-            raw_bytes = f.read(1_000_000)
+            raw_bytes = f.read(300_000)
 
         text, encoding_used = decode_bytes(raw_bytes)
-        candidates = [";", ",", "\t", "|"]
+        lines = text.splitlines()
+        if len(lines) < 2:
+            raise RuntimeError("У CSV недостатньо рядків для аналізу")
 
-        best = None
+        header_line = lines[0]
+        first_data_lines = [ln for ln in lines[1:6] if ln.strip()]
 
-        for delim in candidates:
-            reader = csv.reader(io.StringIO(text), delimiter=delim, quotechar='"')
+        # header у ЄРБ іде через ;
+        header = next(csv.reader([header_line], delimiter=";", quotechar='"'))
+        header_len = len(header)
 
-            try:
-                header = next(reader, [])
-            except Exception:
-                continue
+        # data rows у ЄРБ фактично через ,
+        row_lengths_comma = []
+        for ln in first_data_lines:
+            parsed = next(csv.reader([ln], delimiter=",", quotechar='"'))
+            row_lengths_comma.append(len(parsed))
 
-            sample_rows = []
-            for i, row in enumerate(reader):
-                sample_rows.append(row)
-                if i >= 19:
-                    break
+        same_len_count = sum(1 for x in row_lengths_comma if x == header_len)
 
-            if not header:
-                continue
-
-            header_len = len(header)
-            if header_len <= 1:
-                score = -1000
-            else:
-                row_lengths = [len(r) for r in sample_rows if r]
-                same_len_count = sum(1 for x in row_lengths if x == header_len)
-                nonempty_count = sum(1 for r in sample_rows if any(str(v).strip() for v in r))
-
-                score = 0
-                score += header_len * 20
-                score += same_len_count * 50
-                score += nonempty_count * 5
-
-                # штраф, якщо рядок даних "злипся" в першу колонку
-                if sample_rows:
-                    suspicious = 0
-                    for r in sample_rows[:10]:
-                        if len(r) == header_len:
-                            first_cell = str(r[0])
-                            rest_nonempty = any(str(x).strip() for x in r[1:])
-                            if (";" in first_cell or "," in first_cell) and not rest_nonempty:
-                                suspicious += 1
-                    score -= suspicious * 100
-
-            candidate = {
-                "delimiter": delim,
-                "header": header,
-                "encoding": encoding_used,
-                "csv_name": csv_name,
-                "score": score,
-                "header_len": len(header),
-                "sample_rows": sample_rows[:5],
-            }
-
-            if best is None or candidate["score"] > best["score"]:
-                best = candidate
-
-        if not best or best["header_len"] <= 1:
-            raise RuntimeError(f"Не вдалося коректно визначити header/delimiter для {zip_path}")
+        if header_len <= 1 or same_len_count == 0:
+            raise RuntimeError(
+                f"Не вдалося підтвердити формат ЄРБ: header_len={header_len}, "
+                f"row_lengths_comma={row_lengths_comma}"
+            )
 
         print(
-            f"Chosen delimiter for {zip_path.name}: {repr(best['delimiter'])}; "
-            f"header_len={best['header_len']}; score={best['score']}"
+            f"ERB layout confirmed: header_delim=';'; row_delim=','; "
+            f"header_len={header_len}; same_len_count={same_len_count}"
         )
 
         return {
-            "delimiter": best["delimiter"],
-            "header": best["header"],
-            "encoding": best["encoding"],
-            "csv_name": best["csv_name"],
+            "csv_name": csv_name,
+            "encoding": encoding_used,
+            "header": header,
+            "header_delimiter": ";",
+            "row_delimiter": ",",
         }
 
 
-def iter_csv_rows_from_zip(zip_path: Path, encoding: str, delimiter: str, csv_name: str):
+def iter_erb_rows_from_zip(zip_path: Path, encoding: str, csv_name: str, header: list[str]):
     with zipfile.ZipFile(zip_path, "r") as zf:
         with zf.open(csv_name) as f:
             text_stream = io.TextIOWrapper(f, encoding=encoding, newline="")
-            reader = csv.reader(text_stream, delimiter=delimiter, quotechar='"')
-
-            header = next(reader, None)
-            if not header:
+            header_line = text_stream.readline()
+            if not header_line:
                 return
 
-            header = [str(h) for h in header]
             header_len = len(header)
+            reader = csv.reader(text_stream, delimiter=",", quotechar='"')
 
             for row in reader:
                 if row is None:
@@ -258,7 +221,7 @@ def iter_csv_rows_from_zip(zip_path: Path, encoding: str, delimiter: str, csv_na
                 if len(row) < header_len:
                     row = row + [""] * (header_len - len(row))
                 elif len(row) > header_len:
-                    row = row[:header_len - 1] + [delimiter.join(row[header_len - 1:])]
+                    row = row[:header_len - 1] + [",".join(row[header_len - 1:])]
 
                 yield {header[i]: ("" if row[i] is None else str(row[i])) for i in range(header_len)}
 
@@ -356,21 +319,21 @@ def dedupe_records(records: list):
 
 
 def process_erb(zip_path: Path, watchlist: list, source_date: str, resource_meta: dict):
-    meta = parse_header_and_delimiter_from_zip(zip_path)
+    meta = parse_erb_layout_from_zip(zip_path)
     matches = []
     scanned = 0
 
     print(
-        f"Processing ERB: "
-        f"csv_name={meta['csv_name']}, delimiter={meta['delimiter']}, encoding={meta['encoding']}"
+        f"Processing ERB: csv_name={meta['csv_name']}, "
+        f"encoding={meta['encoding']}, header_delim=';', row_delim=','"
     )
     print("HEADER:", meta["header"])
 
-    for idx, row in enumerate(iter_csv_rows_from_zip(
+    for idx, row in enumerate(iter_erb_rows_from_zip(
         zip_path=zip_path,
         encoding=meta["encoding"],
-        delimiter=meta["delimiter"],
         csv_name=meta["csv_name"],
+        header=meta["header"],
     )):
         if idx < 3:
             print("ROW SAMPLE", idx + 1, row)
@@ -394,9 +357,9 @@ def process_erb(zip_path: Path, watchlist: list, source_date: str, resource_meta
         "notes": (
             f"dataset_title={resource_meta.get('dataset_title', '')}; "
             f"resource_name={resource_meta.get('resource_name', '')}; "
-            f"delimiter={meta['delimiter']}; "
             f"encoding={meta['encoding']}; "
-            f"csv_name={meta['csv_name']}"
+            f"csv_name={meta['csv_name']}; "
+            f"header_delim=; ; row_delim=,"
         ),
     }
 
