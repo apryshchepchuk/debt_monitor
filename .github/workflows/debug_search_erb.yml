@@ -1,10 +1,10 @@
-name: Debug search in ERB
+name: Debug ERB by current watchlist
 
 on:
   workflow_dispatch:
 
 jobs:
-  debug-erb:
+  debug-erb-watchlist:
     runs-on: ubuntu-latest
 
     steps:
@@ -16,12 +16,21 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Run ERB debug search
+      - name: Fetch watchlist
+        env:
+          GSHEET_WEBAPP_URL: ${{ secrets.GSHEET_WEBAPP_URL }}
+          GSHEET_API_TOKEN: ${{ secrets.GSHEET_API_TOKEN }}
+        run: |
+          python get_watchlist.py
+
+      - name: Run ERB watchlist debug
         run: |
           python debug_search_erb.py
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: debug-erb-output
-          path: debug_erb_matches.json
+          name: debug-erb-watchlist-output
+          path: |
+            debug_erb_watchlist.json
+            watchlist.json
