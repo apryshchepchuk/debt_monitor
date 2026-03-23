@@ -11,11 +11,9 @@ from urllib.request import urlopen, Request
 
 
 ERB_DATAPACKAGE_URL = "https://data.gov.ua/dataset/506734bf-2480-448c-a2b4-90b6d06df11e/datapackage"
-ASVP_DATAPACKAGE_URL = "https://data.gov.ua/dataset/6c0eb6c0-d19a-4bb0-869b-3280df46800a/datapackage"
 
 WATCHLIST_PATH = Path("watchlist.json")
 ERB_ZIP_PATH = Path("erb.zip")
-ASVP_ZIP_PATH = Path("asvp.zip")
 
 ENCODINGS_TO_TRY = ["utf-8-sig", "utf-8", "cp1251", "cp1252"]
 
@@ -240,12 +238,10 @@ def match_watchlist(row: dict, watchlist: list):
 
     for w in watchlist:
         if w["entity_type"] == "company":
-            # 1) strong match по коду
             if w["debtor_code"] and row_code and w["debtor_code"] == row_code:
                 matches.append((w, "strong"))
                 continue
 
-            # 2) weak match по назві - навіть якщо код у watchlist є
             if w["debtor_name_norm"] and w["debtor_name_norm"] == row_name:
                 matches.append((w, "weak"))
                 continue
@@ -290,33 +286,6 @@ def build_erb_record(watchlist_item: dict, match_strength: str, row: dict, sourc
     return record
 
 
-def build_asvp_record(watchlist_item: dict, match_strength: str, row: dict, source_date: str):
-    record = {
-        "watchlist_id": watchlist_item["id"],
-        "match_strength": match_strength,
-        "debtor_name": row.get("DEBTOR_NAME", "").strip(),
-        "debtor_birthdate": normalize_birthdate(row.get("DEBTOR_BIRTHDATE", "")),
-        "debtor_code": normalize_code(row.get("DEBTOR_CODE", "")),
-        "creditor_name": row.get("CREDITOR_NAME", "").strip(),
-        "creditor_code": normalize_code(row.get("CREDITOR_CODE", "")),
-        "vp_ordernum": row.get("VP_ORDERNUM", "").strip(),
-        "vp_begindate": row.get("VP_BEGINDATE", "").strip(),
-        "vp_state": row.get("VP_STATE", "").strip(),
-        "org_name": row.get("ORG_NAME", "").strip(),
-        "dvs_code": row.get("DVS_CODE", "").strip(),
-        "phone_num": row.get("PHONE_NUM", "").strip(),
-        "email_addr": row.get("EMAIL_ADDR", "").strip(),
-        "bank_account": row.get("BANK_ACCOUNT", "").strip(),
-        "source_date": source_date,
-        "row_hash": "",
-        "first_seen": source_date,
-        "last_seen": source_date,
-        "is_active": "true",
-    }
-    record["row_hash"] = stable_hash(record)
-    return record
-
-
 def dedupe_records(records: list):
     seen = set()
     result = []
@@ -328,15 +297,13 @@ def dedupe_records(records: list):
     return result
 
 
-def process_source(zip_path: Path, source_name: str, watchlist: list, source_date: str, resource_meta: dict):
+def process_erb(zip_path: Path, watchlist: list, source_date: str, resource_meta: dict):
     meta = parse_header_and_delimiter_from_zip(zip_path)
     matches = []
     scanned = 0
 
-    builder = build_erb_record if source_name == "erb" else build_asvp_record
-
     print(
-        f"Processing {source_name.upper()}: "
+        f"Processing ERB: "
         f"csv_name={meta['csv_name']}, delimiter={meta['delimiter']}, encoding={meta['encoding']}"
     )
 
@@ -352,13 +319,13 @@ def process_source(zip_path: Path, source_name: str, watchlist: list, source_dat
             continue
 
         for watchlist_item, match_strength in found:
-            matches.append(builder(watchlist_item, match_strength, row, source_date))
+            matches.append(build_erb_record(watchlist_item, match_strength, row, source_date))
 
     matches = dedupe_records(matches)
 
     tech_row = {
         "run_at": source_date,
-        "source_name": source_name,
+        "source_name": "erb",
         "status": "ok",
         "rows_scanned": str(scanned),
         "matches_found": str(len(matches)),
@@ -374,64 +341,6 @@ def process_source(zip_path: Path, source_name: str, watchlist: list, source_dat
     return matches, tech_row
 
 
-def build_error_tech_row(source_name: str, source_date: str, stage: str, err: Exception, extra: str = ""):
-    notes = f"stage={stage}; error={str(err)}"
-    if extra:
-        notes += f"; {extra}"
-
-    return {
-        "run_at": source_date,
-        "source_name": source_name,
-        "status": "error",
-        "rows_scanned": "0",
-        "matches_found": "0",
-        "notes": notes,
-    }
-
-
-def safe_process_dataset(
-    source_name: str,
-    datapackage_url: str,
-    zip_path: Path,
-    watchlist: list,
-    source_date: str,
-):
-    try:
-        print(f"Resolving datapackage for {source_name.upper()}...")
-        resource = resolve_resource_from_datapackage(datapackage_url)
-        print(f"{source_name.upper()} resource: {resource['resource_name']}")
-        print(f"{source_name.upper()} ZIP URL: {resource['resource_path']}")
-    except Exception as e:
-        print(f"{source_name.upper()} failed on datapackage resolve: {e}")
-        return [], build_error_tech_row(source_name, source_date, "datapackage", e)
-
-    try:
-        print(f"Downloading {source_name.upper()} ZIP...")
-        fetch_to_file(resource["resource_path"], zip_path)
-    except Exception as e:
-        print(f"{source_name.upper()} failed on ZIP download: {e}")
-        return [], build_error_tech_row(
-            source_name,
-            source_date,
-            "download_zip",
-            e,
-            extra=f"resource_name={resource.get('resource_name', '')}"
-        )
-
-    try:
-        print(f"Filtering {source_name.upper()}...")
-        return process_source(zip_path, source_name, watchlist, source_date, resource)
-    except Exception as e:
-        print(f"{source_name.upper()} failed on processing: {e}")
-        return [], build_error_tech_row(
-            source_name,
-            source_date,
-            "process_csv",
-            e,
-            extra=f"resource_name={resource.get('resource_name', '')}"
-        )
-
-
 def main():
     if not WATCHLIST_PATH.exists():
         raise FileNotFoundError("Не знайдено watchlist.json. Спочатку запусти workflow отримання watchlist.")
@@ -442,38 +351,26 @@ def main():
 
     source_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    erb_rows, erb_tech = safe_process_dataset(
-        source_name="erb",
-        datapackage_url=ERB_DATAPACKAGE_URL,
-        zip_path=ERB_ZIP_PATH,
-        watchlist=watchlist,
-        source_date=source_date,
-    )
+    print("Resolving datapackage for ERB...")
+    erb_resource = resolve_resource_from_datapackage(ERB_DATAPACKAGE_URL)
+    print(f"ERB resource: {erb_resource['resource_name']}")
+    print(f"ERB ZIP URL: {erb_resource['resource_path']}")
 
-    asvp_rows, asvp_tech = safe_process_dataset(
-        source_name="asvp",
-        datapackage_url=ASVP_DATAPACKAGE_URL,
-        zip_path=ASVP_ZIP_PATH,
-        watchlist=watchlist,
-        source_date=source_date,
-    )
+    print("Downloading ERB ZIP...")
+    fetch_to_file(erb_resource["resource_path"], ERB_ZIP_PATH)
+
+    print("Filtering ERB...")
+    erb_rows, erb_tech = process_erb(ERB_ZIP_PATH, watchlist, source_date, erb_resource)
 
     with open("filtered_erb.json", "w", encoding="utf-8") as f:
         json.dump(erb_rows, f, ensure_ascii=False, indent=2)
 
-    with open("filtered_asvp.json", "w", encoding="utf-8") as f:
-        json.dump(asvp_rows, f, ensure_ascii=False, indent=2)
-
     with open("tech_rows.json", "w", encoding="utf-8") as f:
-        json.dump([erb_tech, asvp_tech], f, ensure_ascii=False, indent=2)
+        json.dump([erb_tech], f, ensure_ascii=False, indent=2)
 
     print(f"ERB matches: {len(erb_rows)}")
-    print(f"ASVP matches: {len(asvp_rows)}")
-    print("Saved filtered_erb.json, filtered_asvp.json, tech_rows.json")
+    print("Saved filtered_erb.json, tech_rows.json")
 
-    if erb_tech["status"] != "ok" and asvp_tech["status"] != "ok":
-        raise RuntimeError("Обидва джерела завершились з помилкою.")
-    
 
 if __name__ == "__main__":
     main()
