@@ -360,8 +360,8 @@ def process_source(zip_path: Path, source_name: str, watchlist: list, source_dat
         "rows_scanned": str(scanned),
         "matches_found": str(len(matches)),
         "notes": (
-            f"dataset_title={resource_meta['dataset_title']}; "
-            f"resource_name={resource_meta['resource_name']}; "
+            f"dataset_title={resource_meta.get('dataset_title', '')}; "
+            f"resource_name={resource_meta.get('resource_name', '')}; "
             f"delimiter={meta['delimiter']}; "
             f"encoding={meta['encoding']}; "
             f"csv_name={meta['csv_name']}"
@@ -369,6 +369,64 @@ def process_source(zip_path: Path, source_name: str, watchlist: list, source_dat
     }
 
     return matches, tech_row
+
+
+def build_error_tech_row(source_name: str, source_date: str, stage: str, err: Exception, extra: str = ""):
+    notes = f"stage={stage}; error={str(err)}"
+    if extra:
+        notes += f"; {extra}"
+
+    return {
+        "run_at": source_date,
+        "source_name": source_name,
+        "status": "error",
+        "rows_scanned": "0",
+        "matches_found": "0",
+        "notes": notes,
+    }
+
+
+def safe_process_dataset(
+    source_name: str,
+    datapackage_url: str,
+    zip_path: Path,
+    watchlist: list,
+    source_date: str,
+):
+    try:
+        print(f"Resolving datapackage for {source_name.upper()}...")
+        resource = resolve_resource_from_datapackage(datapackage_url)
+        print(f"{source_name.upper()} resource: {resource['resource_name']}")
+        print(f"{source_name.upper()} ZIP URL: {resource['resource_path']}")
+    except Exception as e:
+        print(f"{source_name.upper()} failed on datapackage resolve: {e}")
+        return [], build_error_tech_row(source_name, source_date, "datapackage", e)
+
+    try:
+        print(f"Downloading {source_name.upper()} ZIP...")
+        fetch_to_file(resource["resource_path"], zip_path)
+    except Exception as e:
+        print(f"{source_name.upper()} failed on ZIP download: {e}")
+        return [], build_error_tech_row(
+            source_name,
+            source_date,
+            "download_zip",
+            e,
+            extra=f"resource_name={resource.get('resource_name', '')}"
+        )
+
+    try:
+        print(f"Filtering {source_name.upper()}...")
+        return process_source(zip_path, source_name, watchlist, source_date, resource)
+    except Exception as e:
+        print(f"{source_name.upper()} failed on processing: {e}")
+        return [], build_error_tech_row(
+            source_name,
+            source_date,
+            "process_csv",
+            e,
+            extra=f"resource_name={resource.get('resource_name', '')}"
+        )
 
 
 def main():
@@ -381,27 +439,21 @@ def main():
 
     source_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    print("Resolving datapackage for ERB...")
-    erb_resource = resolve_resource_from_datapackage(ERB_DATAPACKAGE_URL)
-    print(f"ERB resource: {erb_resource['resource_name']}")
-    print(f"ERB ZIP URL: {erb_resource['resource_path']}")
+    erb_rows, erb_tech = safe_process_dataset(
+        source_name="erb",
+        datapackage_url=ERB_DATAPACKAGE_URL,
+        zip_path=ERB_ZIP_PATH,
+        watchlist=watchlist,
+        source_date=source_date,
+    )
 
-    print("Resolving datapackage for ASVP...")
-    asvp_resource = resolve_resource_from_datapackage(ASVP_DATAPACKAGE_URL)
-    print(f"ASVP resource: {asvp_resource['resource_name']}")
-    print(f"ASVP ZIP URL: {asvp_resource['resource_path']}")
-
-    print("Downloading ERB ZIP...")
-    fetch_to_file(erb_resource["resource_path"], ERB_ZIP_PATH)
-
-    print("Downloading ASVP ZIP...")
-    fetch_to_file(asvp_resource["resource_path"], ASVP_ZIP_PATH)
-
-    print("Filtering ERB...")
-    erb_rows, erb_tech = process_source(ERB_ZIP_PATH, "erb", watchlist, source_date, erb_resource)
-
-    print("Filtering ASVP...")
-    asvp_rows, asvp_tech = process_source(ASVP_ZIP_PATH, "asvp", watchlist, source_date, asvp_resource)
+    asvp_rows, asvp_tech = safe_process_dataset(
+        source_name="asvp",
+        datapackage_url=ASVP_DATAPACKAGE_URL,
+        zip_path=ASVP_ZIP_PATH,
+        watchlist=watchlist,
+        source_date=source_date,
+    )
 
     with open("filtered_erb.json", "w", encoding="utf-8") as f:
         json.dump(erb_rows, f, ensure_ascii=False, indent=2)
@@ -416,6 +468,9 @@ def main():
     print(f"ASVP matches: {len(asvp_rows)}")
     print("Saved filtered_erb.json, filtered_asvp.json, tech_rows.json")
 
+    if erb_tech["status"] != "ok" and asvp_tech["status"] != "ok":
+        raise RuntimeError("Обидва джерела завершились з помилкою.")
+    
 
 if __name__ == "__main__":
     main()
