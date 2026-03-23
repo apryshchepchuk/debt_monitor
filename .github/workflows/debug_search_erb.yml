@@ -1,0 +1,27 @@
+name: Debug search in ERB
+
+on:
+  workflow_dispatch:
+
+jobs:
+  debug-erb:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run ERB debug search
+        run: |
+          python debug_search_erb.py
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: debug-erb-output
+          path: debug_erb_matches.json
