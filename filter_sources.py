@@ -240,12 +240,15 @@ def match_watchlist(row: dict, watchlist: list):
 
     for w in watchlist:
         if w["entity_type"] == "company":
+            # 1) strong match по коду
             if w["debtor_code"] and row_code and w["debtor_code"] == row_code:
                 matches.append((w, "strong"))
                 continue
 
-            if not w["debtor_code"] and w["debtor_name_norm"] and w["debtor_name_norm"] == row_name:
+            # 2) weak match по назві - навіть якщо код у watchlist є
+            if w["debtor_name_norm"] and w["debtor_name_norm"] == row_name:
                 matches.append((w, "weak"))
+                continue
 
         elif w["entity_type"] == "person":
             if w["debtor_name_norm"] and w["debtor_name_norm"] == row_name:
