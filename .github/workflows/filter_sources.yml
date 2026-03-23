@@ -1,4 +1,4 @@
-name: Filter ERB and ASVP by watchlist
+name: Filter ERB by watchlist
 
 on:
   workflow_dispatch:
@@ -23,7 +23,7 @@ jobs:
         run: |
           python get_watchlist.py
 
-      - name: Filter sources
+      - name: Filter ERB
         run: |
           python filter_sources.py
 
@@ -33,6 +33,5 @@ jobs:
           name: filtered-output
           path: |
             filtered_erb.json
-            filtered_asvp.json
             tech_rows.json
             watchlist.json
