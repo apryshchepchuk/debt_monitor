@@ -27,6 +27,13 @@ jobs:
         run: |
           python filter_sources.py
 
+      - name: Push snapshot to Google Sheets
+        env:
+          GSHEET_WEBAPP_URL: ${{ secrets.GSHEET_WEBAPP_URL }}
+          GSHEET_API_TOKEN: ${{ secrets.GSHEET_API_TOKEN }}
+        run: |
+          python push_snapshot.py
+
       - name: Upload artifacts
         uses: actions/upload-artifact@v4
         with:
