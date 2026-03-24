@@ -34,6 +34,10 @@ jobs:
         run: |
           python filter_sources.py
 
+      - name: Build alerts
+        run: |
+          python build_alerts.py
+
       - name: Push snapshot to Google Sheets
         env:
           GSHEET_WEBAPP_URL: ${{ secrets.GSHEET_WEBAPP_URL }}
@@ -50,3 +54,4 @@ jobs:
             tech_rows.json
             watchlist.json
             erb_current.json
+            alerts.json
