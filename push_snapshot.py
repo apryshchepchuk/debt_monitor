@@ -31,6 +31,7 @@ def post_json(url: str, payload: dict):
 def main():
     erb_rows = load_json("filtered_erb.json", [])
     tech_rows = load_json("tech_rows.json", [])
+    alert_rows = load_json("alerts.json", [])
 
     source_date = ""
     if tech_rows and isinstance(tech_rows, list):
@@ -42,6 +43,7 @@ def main():
         "source_date": source_date,
         "erb_rows": erb_rows,
         "tech_rows": tech_rows,
+        "alert_rows": alert_rows,
     }
 
     status, body = post_json(WEBAPP_URL, payload)
@@ -52,11 +54,7 @@ def main():
     if status != 200:
         raise RuntimeError(f"Unexpected HTTP status: {status}")
 
-    try:
-        parsed = json.loads(body)
-    except Exception:
-        raise RuntimeError(f"Invalid JSON response: {body}")
-
+    parsed = json.loads(body)
     if not parsed.get("ok"):
         raise RuntimeError(f"Apps Script returned error: {parsed}")
 
