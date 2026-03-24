@@ -18,7 +18,6 @@ def save_json(path: str, data):
 def make_key(row: dict) -> str:
     return "|".join([
         str(row.get("watchlist_id", "")).strip(),
-        str(row.get("debtor_code", "")).strip(),
         str(row.get("vp_ordernum", "")).strip(),
     ])
 
