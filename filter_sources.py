@@ -84,18 +84,36 @@ def fetch_to_file(url: str, target_path: Path, retries: int = 3, timeout: int = 
                     "Cache-Control": "no-cache",
                 },
             )
-            with urlopen(req, timeout=timeout) as response, open(target_path, "wb") as out:
-                while True:
-                    chunk = response.read(1024 * 1024)
-                    if not chunk:
-                        break
-                    out.write(chunk)
 
-            if target_path.suffix.lower() == ".zip":
-                with zipfile.ZipFile(target_path, "r") as zf:
-                    bad_member = zf.testzip()
-                    if bad_member is not None:
-                        raise zipfile.BadZipFile(f"CRC failed for member: {bad_member}")
+            with urlopen(req, timeout=timeout) as response:
+                content_type = response.headers.get("Content-Type", "")
+                print(f"Content-Type: {content_type}")
+
+                data = response.read()
+
+            with open(target_path, "wb") as out:
+                out.write(data)
+
+            # Перевірка сигнатури ZIP
+            if len(data) < 2 or data[:2] != b"PK":
+                preview_path = target_path.with_suffix(".preview.txt")
+                try:
+                    preview_text = data[:2000].decode("utf-8", errors="replace")
+                except Exception:
+                    preview_text = repr(data[:2000])
+
+                with open(preview_path, "w", encoding="utf-8") as f:
+                    f.write(preview_text)
+
+                raise RuntimeError(
+                    f"Downloaded content is not a ZIP. "
+                    f"Content-Type={content_type}. Preview saved to {preview_path}"
+                )
+
+            with zipfile.ZipFile(target_path, "r") as zf:
+                bad_member = zf.testzip()
+                if bad_member is not None:
+                    raise zipfile.BadZipFile(f"CRC failed for member: {bad_member}")
 
             return target_path
 
@@ -105,10 +123,9 @@ def fetch_to_file(url: str, target_path: Path, retries: int = 3, timeout: int = 
             if target_path.exists():
                 target_path.unlink(missing_ok=True)
             if attempt < retries:
-                time.sleep(5 * attempt)
+                time.sleep(10 * attempt)
 
     raise RuntimeError(f"Не вдалося коректно завантажити файл {url}: {last_error}")
-
 
 def resolve_resource_from_datapackage(datapackage_url: str) -> dict:
     raw = fetch_text(datapackage_url)
