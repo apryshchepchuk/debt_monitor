@@ -11,6 +11,7 @@ from urllib.request import urlopen, Request
 
 
 ERB_DATAPACKAGE_URL = "https://data.gov.ua/dataset/506734bf-2480-448c-a2b4-90b6d06df11e/datapackage"
+ERB_FALLBACK_ZIP_URL = "https://data.gov.ua/dataset/783b9b50-faba-4cc9-a393-60485e395b1d/resource/e6ea76c1-01f4-4bd0-a282-7d92d6ecc2a1/download/31-ex_csv_erb.zip"
 
 WATCHLIST_PATH = Path("watchlist.json")
 ERB_ZIP_PATH = Path("erb.zip")
@@ -44,7 +45,7 @@ def truthy(value) -> bool:
     return str(value).strip().lower() in {"true", "1", "yes", "y"}
 
 
-def fetch_text(url: str, retries: int = 4, timeout: int = 90) -> str:
+def fetch_text(url: str, retries: int = 6, timeout: int = 180) -> str:
     last_error = None
 
     for attempt in range(1, retries + 1):
@@ -65,7 +66,7 @@ def fetch_text(url: str, retries: int = 4, timeout: int = 90) -> str:
             last_error = e
             print(f"Fetch failed: {e}")
             if attempt < retries:
-                time.sleep(5 * attempt)
+                time.sleep(10 * attempt)
 
     raise RuntimeError(f"Не вдалося завантажити текст із {url}: {last_error}")
 
@@ -88,13 +89,11 @@ def fetch_to_file(url: str, target_path: Path, retries: int = 3, timeout: int = 
             with urlopen(req, timeout=timeout) as response:
                 content_type = response.headers.get("Content-Type", "")
                 print(f"Content-Type: {content_type}")
-
                 data = response.read()
 
             with open(target_path, "wb") as out:
                 out.write(data)
 
-            # Перевірка сигнатури ZIP
             if len(data) < 2 or data[:2] != b"PK":
                 preview_path = target_path.with_suffix(".preview.txt")
                 try:
@@ -127,33 +126,57 @@ def fetch_to_file(url: str, target_path: Path, retries: int = 3, timeout: int = 
 
     raise RuntimeError(f"Не вдалося коректно завантажити файл {url}: {last_error}")
 
-def resolve_resource_from_datapackage(datapackage_url: str) -> dict:
-    raw = fetch_text(datapackage_url)
-    data = json.loads(raw)
 
-    resources = data.get("resources", [])
-    if not resources:
-        raise RuntimeError(f"У datapackage немає resources: {datapackage_url}")
+def fetch_to_file_with_fallback(primary_url: str, fallback_url: str, target_path: Path) -> Path:
+    try:
+        print(f"Trying primary ZIP URL: {primary_url}")
+        return fetch_to_file(primary_url, target_path)
+    except Exception as e:
+        print(f"Primary ZIP failed: {e}")
+        if primary_url == fallback_url:
+            raise
+        print(f"Trying fallback ZIP URL: {fallback_url}")
+        return fetch_to_file(fallback_url, target_path)
 
-    zip_resources = [
-        r for r in resources
-        if str(r.get("format", "")).upper() == "ZIP" or str(r.get("path", "")).lower().endswith(".zip")
-    ]
-    if not zip_resources:
-        raise RuntimeError(f"У datapackage немає ZIP-ресурсу: {datapackage_url}")
 
-    resource = zip_resources[0]
-    path = resource.get("path", "")
-    name = resource.get("name", "")
+def resolve_resource_from_datapackage(datapackage_url: str, fallback_zip_url: str) -> dict:
+    try:
+        raw = fetch_text(datapackage_url)
+        data = json.loads(raw)
 
-    if not path:
-        raise RuntimeError(f"У ресурсі немає path: {datapackage_url}")
+        resources = data.get("resources", [])
+        if not resources:
+            raise RuntimeError(f"У datapackage немає resources: {datapackage_url}")
 
-    return {
-        "dataset_title": data.get("title", ""),
-        "resource_name": name,
-        "resource_path": path,
-    }
+        zip_resources = [
+            r for r in resources
+            if str(r.get("format", "")).upper() == "ZIP" or str(r.get("path", "")).lower().endswith(".zip")
+        ]
+        if not zip_resources:
+            raise RuntimeError(f"У datapackage немає ZIP-ресурсу: {datapackage_url}")
+
+        resource = zip_resources[0]
+        path = resource.get("path", "")
+        name = resource.get("name", "")
+
+        if not path:
+            raise RuntimeError(f"У ресурсі немає path: {datapackage_url}")
+
+        return {
+            "dataset_title": data.get("title", ""),
+            "resource_name": name or "datapackage_resource",
+            "resource_path": path,
+            "used_fallback": False,
+        }
+
+    except Exception as e:
+        print(f"Datapackage unavailable, using fallback ZIP URL: {e}")
+        return {
+            "dataset_title": "ERB fallback resource",
+            "resource_name": "fallback_zip",
+            "resource_path": fallback_zip_url,
+            "used_fallback": True,
+        }
 
 
 def decode_bytes(raw_bytes: bytes):
@@ -185,11 +208,9 @@ def parse_erb_layout_from_zip(zip_path: Path):
         header_line = lines[0]
         first_data_lines = [ln for ln in lines[1:6] if ln.strip()]
 
-        # header у ЄРБ іде через ;
         header = next(csv.reader([header_line], delimiter=";", quotechar='"'))
         header_len = len(header)
 
-        # data rows у ЄРБ фактично через ,
         row_lengths_comma = []
         for ln in first_data_lines:
             parsed = next(csv.reader([ln], delimiter=",", quotechar='"'))
@@ -376,7 +397,8 @@ def process_erb(zip_path: Path, watchlist: list, source_date: str, resource_meta
             f"resource_name={resource_meta.get('resource_name', '')}; "
             f"encoding={meta['encoding']}; "
             f"csv_name={meta['csv_name']}; "
-            f"header_delim=; ; row_delim=,"
+            f"header_delim=; ; row_delim=,; "
+            f"used_fallback={resource_meta.get('used_fallback', False)}"
         ),
     }
 
@@ -394,12 +416,20 @@ def main():
     source_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
     print("Resolving datapackage for ERB...")
-    erb_resource = resolve_resource_from_datapackage(ERB_DATAPACKAGE_URL)
+    erb_resource = resolve_resource_from_datapackage(
+        ERB_DATAPACKAGE_URL,
+        ERB_FALLBACK_ZIP_URL
+    )
     print(f"ERB resource: {erb_resource['resource_name']}")
     print(f"ERB ZIP URL: {erb_resource['resource_path']}")
+    print(f"Used fallback: {erb_resource['used_fallback']}")
 
     print("Downloading ERB ZIP...")
-    fetch_to_file(erb_resource["resource_path"], ERB_ZIP_PATH)
+    fetch_to_file_with_fallback(
+        erb_resource["resource_path"],
+        ERB_FALLBACK_ZIP_URL,
+        ERB_ZIP_PATH
+    )
 
     print("Filtering ERB...")
     erb_rows, erb_tech = process_erb(ERB_ZIP_PATH, watchlist, source_date, erb_resource)
