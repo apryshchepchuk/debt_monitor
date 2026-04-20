@@ -1,1 +1,48 @@
+<!doctype html>
+<html lang="uk">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Моніторинг ЄРБ</title>
+  <link rel="stylesheet" href="./styles.css" />
+</head>
+<body>
+  <main class="page">
+    <header class="topbar">
+      <div>
+        <h1>Моніторинг ЄРБ</h1>
+        <p class="subtitle">Активні та історичні записи по боржниках</p>
+      </div>
+      <div class="updated" id="updatedAt">Оновлення: —</div>
+    </header>
 
+    <section id="tokenBox" class="token-box hidden">
+      <p>Для перегляду dashboard потрібен token доступу.</p>
+      <div class="token-row">
+        <input id="tokenInput" type="password" placeholder="Встав token" />
+        <button id="saveTokenBtn">Відкрити</button>
+      </div>
+    </section>
+
+    <section class="controls">
+      <input
+        id="searchInput"
+        class="search"
+        type="search"
+        placeholder="Пошук за назвою, кодом, датою народження, ВП або виконавцем..."
+      />
+
+      <div class="tabs" role="tablist">
+        <button class="tab active" id="activeTabBtn" data-tab="active">Активні</button>
+        <button class="tab" id="historyTabBtn" data-tab="history">Історія</button>
+      </div>
+    </section>
+
+    <section id="statusBox" class="status-box">Завантаження даних…</section>
+
+    <section id="content" class="content"></section>
+  </main>
+
+  <script src="./app.js"></script>
+</body>
+</html>
