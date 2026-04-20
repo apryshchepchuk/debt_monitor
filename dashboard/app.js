@@ -269,12 +269,31 @@ function formatDate(value) {
   if (!value) return "—";
 
   const s = String(value).trim();
-  const m = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:\s+(\d{2}):(\d{2}))?/);
 
-  if (!m) return s;
+  // Основний формат з Apps Script: 2026-04-20 07:20:11
+  const isoLike = s.match(/^(\d{4})-(\d{2})-(\d{2})(?:\s+(\d{2}):(\d{2}))?/);
+  if (isoLike) {
+    const [, y, mo, d, hh, mm] = isoLike;
+    return `${d}.${mo}.${y}${hh && mm ? ` ${hh}:${mm}` : ""}`;
+  }
 
-  const [, y, mo, d, hh, mm] = m;
-  return `${d}.${mo}.${y}${hh && mm ? ` ${hh}:${mm}` : ""}`;
+  // Старий Google/JS формат: Mon Apr 20 2026 07:20:11 GMT+0300 ...
+  const jsDateLike = s.match(/^[A-Za-z]{3}\s+([A-Za-z]{3})\s+(\d{1,2})\s+(\d{4})\s+(\d{2}):(\d{2})/);
+  if (jsDateLike) {
+    const months = {
+      Jan: "01", Feb: "02", Mar: "03", Apr: "04",
+      May: "05", Jun: "06", Jul: "07", Aug: "08",
+      Sep: "09", Oct: "10", Nov: "11", Dec: "12",
+    };
+
+    const [, mon, day, year, hh, mm] = jsDateLike;
+    const mo = months[mon] || mon;
+    const d = String(day).padStart(2, "0");
+
+    return `${d}.${mo}.${year} ${hh}:${mm}`;
+  }
+
+  return s;
 }
 
 function escapeHtml(value) {
