@@ -68,7 +68,7 @@ function bindEvents() {
   });
 
     els.content.addEventListener("click", (e) => {
-    if (e.target.closest("details, summary, a, button, input")) return;
+    if (e.target.closest("details, summary, a, button, input, .record")) return;
 
     const card = e.target.closest(".debtor-card");
     if (!card) return;
