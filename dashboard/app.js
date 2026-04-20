@@ -166,6 +166,10 @@ function getRecordsForCurrentTab(records) {
     return records.filter((r) => r.status === "active");
   }
 
+  if (state.tab === "history") {
+    return records.filter((r) => r.status !== "active");
+  }
+
   return records;
 }
 
