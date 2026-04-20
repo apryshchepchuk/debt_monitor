@@ -5,6 +5,7 @@ let state = {
   tab: "active",
   query: "",
   token: "",
+  expandedDebtors: new Set(),
 };
 
 const els = {
@@ -64,6 +65,24 @@ function bindEvents() {
     state.token = token;
     hideTokenBox();
     loadDashboardData();
+  });
+
+    els.content.addEventListener("click", (e) => {
+    if (e.target.closest("details, summary, a, button, input")) return;
+
+    const card = e.target.closest(".debtor-card");
+    if (!card) return;
+
+    const key = card.dataset.debtorKey;
+    if (!key) return;
+
+    if (state.expandedDebtors.has(key)) {
+      state.expandedDebtors.delete(key);
+    } else {
+      state.expandedDebtors.add(key);
+    }
+
+    render();
   });
 }
 
@@ -172,7 +191,18 @@ function matchesSearch(debtor) {
   return haystack.includes(state.query);
 }
 
+function buildDebtorKey(debtor) {
+  if (debtor.debtor_code) return `code:${debtor.debtor_code}`;
+  if (debtor.debtor_name && debtor.debtor_birthdate) {
+    return `person:${debtor.debtor_name}|${debtor.debtor_birthdate}`;
+  }
+  return `name:${debtor.debtor_name || "unknown"}`;
+}
+
 function renderDebtorCard(debtor) {
+  const debtorKey = buildDebtorKey(debtor);
+  const isExpanded = state.expandedDebtors.has(debtorKey);
+
   const activeCount = debtor.records.filter((r) => r.status === "active").length;
   const totalCount = debtor.records.length;
 
@@ -189,11 +219,19 @@ function renderDebtorCard(debtor) {
 
   const countText =
     state.tab === "active"
-      ? pluralizeRecords(totalCount) + " · востаннє підтверджено " + formatDate(debtor.last_seen)
-      : pluralizeRecords(totalCount);
+      ? `${pluralizeRecords(totalCount)} · востаннє підтверджено ${formatDate(debtor.last_seen)}`
+      : `${pluralizeRecords(totalCount)}`;
+
+  const recordsHtml = isExpanded
+    ? `
+      <div class="records">
+        ${(debtor.records || []).map(renderRecord).join("")}
+      </div>
+    `
+    : "";
 
   return `
-    <article class="debtor-card">
+    <article class="debtor-card ${isExpanded ? "expanded" : "collapsed"}" data-debtor-key="${escapeHtml(debtorKey)}">
       <div class="debtor-head">
         <div>
           <h2 class="debtor-title">${escapeHtml(debtor.debtor_name || "Без назви")}</h2>
@@ -202,9 +240,12 @@ function renderDebtorCard(debtor) {
         ${badge}
       </div>
 
-      <div class="records">
-        ${(debtor.records || []).map(renderRecord).join("")}
+      <div class="expand-hint">
+        <span>${isExpanded ? "Сховати записи" : "Показати записи"}</span>
+        <span class="chevron">${isExpanded ? "⌃" : "⌄"}</span>
       </div>
+
+      ${recordsHtml}
     </article>
   `;
 }
