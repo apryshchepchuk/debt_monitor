@@ -287,30 +287,86 @@ def load_watchlist(path: Path):
     print(f"Loaded watchlist rows: {len(active)} active")
     return active
 
+def build_watchlist_index(watchlist: list) -> dict:
+    index = {
+        "company_by_code": {},
+        "company_by_name": {},
+        "person_by_name_birthdate": {},
+        "person_by_name": {},
+    }
 
-def match_watchlist(row: dict, watchlist: list):
+    for w in watchlist:
+        entity_type = w.get("entity_type", "")
+        name = w.get("debtor_name_norm", "")
+        code = w.get("debtor_code", "")
+        birthdate = w.get("birthdate", "")
+
+        if entity_type == "company":
+            if code:
+                index["company_by_code"].setdefault(code, []).append(w)
+
+            if name:
+                index["company_by_name"].setdefault(name, []).append(w)
+
+        elif entity_type == "person":
+            if name and birthdate:
+                key = f"{name}|{birthdate}"
+                index["person_by_name_birthdate"].setdefault(key, []).append(w)
+
+            if name:
+                index["person_by_name"].setdefault(name, []).append(w)
+
+    print(
+        "Watchlist index built: "
+        f"company_by_code={len(index['company_by_code'])}, "
+        f"company_by_name={len(index['company_by_name'])}, "
+        f"person_by_name_birthdate={len(index['person_by_name_birthdate'])}, "
+        f"person_by_name={len(index['person_by_name'])}"
+    )
+
+    return index
+
+def match_watchlist_indexed(row: dict, watchlist_index: dict):
     row_name = normalize_text(row.get("DEBTOR_NAME", ""))
     row_code = normalize_code(row.get("DEBTOR_CODE", ""))
     row_birthdate = normalize_birthdate(row.get("DEBTOR_BIRTHDATE", ""))
 
     matches = []
+    matched_ids = set()
 
-    for w in watchlist:
-        if w["entity_type"] == "company":
-            if w["debtor_code"] and row_code and w["debtor_code"] == row_code:
-                matches.append((w, "strong"))
+    def add_match(w, strength: str):
+        key = str(w.get("id", ""))
+        if key in matched_ids:
+            return
+        matched_ids.add(key)
+        matches.append((w, strength))
+
+    # 1. Юрособи: strong match по коду
+    if row_code:
+        for w in watchlist_index["company_by_code"].get(row_code, []):
+            add_match(w, "strong")
+
+    # 2. Юрособи: weak match по точній нормалізованій назві
+    if row_name:
+        for w in watchlist_index["company_by_name"].get(row_name, []):
+            add_match(w, "weak")
+
+    # 3. Фізособи: strong match по ПІБ + дата народження
+    if row_name and row_birthdate:
+        person_key = f"{row_name}|{row_birthdate}"
+        for w in watchlist_index["person_by_name_birthdate"].get(person_key, []):
+            add_match(w, "strong")
+
+    # 4. Фізособи: weak match по ПІБ, якщо дата народження відсутня з одного боку
+    if row_name:
+        for w in watchlist_index["person_by_name"].get(row_name, []):
+            w_birthdate = w.get("birthdate", "")
+
+            if w_birthdate and row_birthdate and w_birthdate != row_birthdate:
                 continue
 
-            if w["debtor_name_norm"] and w["debtor_name_norm"] == row_name:
-                matches.append((w, "weak"))
-                continue
-
-        elif w["entity_type"] == "person":
-            if w["debtor_name_norm"] and w["debtor_name_norm"] == row_name:
-                if w["birthdate"] and row_birthdate and w["birthdate"] == row_birthdate:
-                    matches.append((w, "strong"))
-                elif not w["birthdate"] or not row_birthdate:
-                    matches.append((w, "weak"))
+            if not w_birthdate or not row_birthdate:
+                add_match(w, "weak")
 
     return matches
 
@@ -360,6 +416,7 @@ def process_erb(zip_path: Path, watchlist: list, source_date: str, resource_meta
     meta = parse_erb_layout_from_zip(zip_path)
     matches = []
     scanned = 0
+    watchlist_index = build_watchlist_index(watchlist)
 
     print(
         f"Processing ERB: csv_name={meta['csv_name']}, "
@@ -377,7 +434,7 @@ def process_erb(zip_path: Path, watchlist: list, source_date: str, resource_meta
             print("ROW SAMPLE", idx + 1, row)
 
         scanned += 1
-        found = match_watchlist(row, watchlist)
+        found = match_watchlist_indexed(row, watchlist_index)
         if not found:
             continue
 
