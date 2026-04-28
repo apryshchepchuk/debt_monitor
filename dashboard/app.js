@@ -67,23 +67,26 @@ function bindEvents() {
     loadDashboardData();
   });
 
-    els.content.addEventListener("click", (e) => {
-    if (e.target.closest("details, summary, a, button, input, .record")) return;
+els.content.addEventListener("click", (e) => {
+  if (e.target.closest("details, summary, a, button, input, .record")) return;
 
-    const card = e.target.closest(".debtor-card");
-    if (!card) return;
+  const selection = window.getSelection();
+  if (selection && String(selection).trim()) return;
 
-    const key = card.dataset.debtorKey;
-    if (!key) return;
+  const card = e.target.closest(".debtor-card");
+  if (!card) return;
 
-    if (state.expandedDebtors.has(key)) {
-      state.expandedDebtors.delete(key);
-    } else {
-      state.expandedDebtors.add(key);
-    }
+  const key = card.dataset.debtorKey;
+  if (!key) return;
 
-    render();
-  });
+  if (state.expandedDebtors.has(key)) {
+    state.expandedDebtors.delete(key);
+  } else {
+    state.expandedDebtors.add(key);
+  }
+
+  render();
+});
 }
 
 function showTokenBox() {
