@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import csv
 import io
 import json
@@ -6,12 +8,15 @@ import zipfile
 import hashlib
 import time
 from datetime import datetime
+from html import unescape
 from pathlib import Path
+from urllib.parse import urljoin
 from urllib.request import urlopen, Request
 
 
 ERB_DATAPACKAGE_URL = "https://data.gov.ua/dataset/506734bf-2480-448c-a2b4-90b6d06df11e/datapackage"
 ERB_FALLBACK_ZIP_URL = "https://data.gov.ua/dataset/783b9b50-faba-4cc9-a393-60485e395b1d/resource/e6ea76c1-01f4-4bd0-a282-7d92d6ecc2a1/download/31-ex_csv_erb.zip"
+ERB_NAIS_PAGE_URL = "https://nais.gov.ua/m/ediniy-reestr-borjnikiv-549"
 
 WATCHLIST_PATH = Path("watchlist.json")
 ERB_ZIP_PATH = Path("erb.zip")
@@ -45,6 +50,16 @@ def truthy(value) -> bool:
     return str(value).strip().lower() in {"true", "1", "yes", "y"}
 
 
+def pick_field(row: dict, *names: str) -> str:
+    for name in names:
+        if name in row:
+            value = row.get(name, "")
+            text = "" if value is None else str(value).strip()
+            if text:
+                return text
+    return ""
+
+
 def fetch_text(url: str, retries: int = 6, timeout: int = 180) -> str:
     last_error = None
 
@@ -61,7 +76,7 @@ def fetch_text(url: str, retries: int = 6, timeout: int = 180) -> str:
             )
             with urlopen(req, timeout=timeout) as response:
                 raw = response.read()
-                return raw.decode("utf-8")
+                return raw.decode("utf-8", errors="replace")
         except Exception as e:
             last_error = e
             print(f"Fetch failed: {e}")
@@ -97,9 +112,9 @@ def fetch_to_file(url: str, target_path: Path, retries: int = 3, timeout: int = 
             if len(data) < 2 or data[:2] != b"PK":
                 preview_path = target_path.with_suffix(".preview.txt")
                 try:
-                    preview_text = data[:2000].decode("utf-8", errors="replace")
+                    preview_text = data[:3000].decode("utf-8", errors="replace")
                 except Exception:
-                    preview_text = repr(data[:2000])
+                    preview_text = repr(data[:3000])
 
                 with open(preview_path, "w", encoding="utf-8") as f:
                     f.write(preview_text)
@@ -127,56 +142,123 @@ def fetch_to_file(url: str, target_path: Path, retries: int = 3, timeout: int = 
     raise RuntimeError(f"Не вдалося коректно завантажити файл {url}: {last_error}")
 
 
-def fetch_to_file_with_fallback(primary_url: str, fallback_url: str, target_path: Path) -> Path:
+def resolve_resource_from_datapackage(datapackage_url: str) -> dict:
+    raw = fetch_text(datapackage_url)
+    data = json.loads(raw)
+
+    resources = data.get("resources", [])
+    if not resources:
+        raise RuntimeError(f"У datapackage немає resources: {datapackage_url}")
+
+    zip_resources = [
+        r for r in resources
+        if str(r.get("format", "")).upper() == "ZIP"
+        or str(r.get("path", "")).lower().endswith(".zip")
+    ]
+    if not zip_resources:
+        raise RuntimeError(f"У datapackage немає ZIP-ресурсу: {datapackage_url}")
+
+    resource = zip_resources[0]
+    path = resource.get("path", "")
+    name = resource.get("name", "")
+
+    if not path:
+        raise RuntimeError(f"У ресурсі немає path: {datapackage_url}")
+
+    return {
+        "dataset_title": data.get("title", ""),
+        "resource_name": name or "datapackage_resource",
+        "resource_path": path,
+        "used_fallback": False,
+        "fallback_source": "",
+    }
+
+
+def resolve_resource_from_nais_page(page_url: str) -> dict:
+    html = fetch_text(page_url, retries=4, timeout=120)
+    html = unescape(html)
+
+    hrefs = re.findall(r'href=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+
+    candidates = []
+    for href in hrefs:
+        full_url = urljoin(page_url, href)
+        lower = full_url.lower()
+
+        if "ex_csv_erb.zip" in lower and "struct" not in lower:
+            candidates.append(full_url)
+
+    if not candidates:
+        text_candidates = re.findall(
+            r'https?://[^\s"\'<>]+ex_csv_erb\.zip',
+            html,
+            flags=re.IGNORECASE,
+        )
+        candidates.extend(text_candidates)
+
+    unique = []
+    seen = set()
+    for url in candidates:
+        if url not in seen:
+            seen.add(url)
+            unique.append(url)
+
+    if not unique:
+        raise RuntimeError(f"На сторінці NAIS не знайдено актуального ZIP для ЄРБ: {page_url}")
+
+    def score(url: str) -> tuple[int, int]:
+        m = re.search(r'(\d+)-ex_csv_erb\.zip', url, flags=re.IGNORECASE)
+        prefix_num = int(m.group(1)) if m else -1
+        return (prefix_num, -len(url))
+
+    best_url = sorted(unique, key=score, reverse=True)[0]
+    best_name = best_url.rstrip("/").split("/")[-1]
+
+    return {
+        "dataset_title": "Єдиний реєстр боржників (NAIS page fallback)",
+        "resource_name": best_name,
+        "resource_path": best_url,
+        "used_fallback": True,
+        "fallback_source": "nais_page",
+    }
+
+
+def download_erb_zip(target_path: Path) -> dict:
+    last_error = None
+
     try:
-        print(f"Trying primary ZIP URL: {primary_url}")
-        return fetch_to_file(primary_url, target_path)
+        print("Resolving datapackage for ERB...")
+        resource = resolve_resource_from_datapackage(ERB_DATAPACKAGE_URL)
+        print(f"ERB resource: {resource['resource_name']}")
+        print(f"ERB ZIP URL: {resource['resource_path']}")
+        print("Downloading ERB ZIP from data.gov.ua...")
+        fetch_to_file(resource["resource_path"], target_path)
+        return resource
     except Exception as e:
-        print(f"Primary ZIP failed: {e}")
-        if primary_url == fallback_url:
-            raise
-        print(f"Trying fallback ZIP URL: {fallback_url}")
-        return fetch_to_file(fallback_url, target_path)
+        last_error = e
+        print(f"Primary data.gov.ua source failed: {e}")
 
-
-def resolve_resource_from_datapackage(datapackage_url: str, fallback_zip_url: str) -> dict:
     try:
-        raw = fetch_text(datapackage_url)
-        data = json.loads(raw)
-
-        resources = data.get("resources", [])
-        if not resources:
-            raise RuntimeError(f"У datapackage немає resources: {datapackage_url}")
-
-        zip_resources = [
-            r for r in resources
-            if str(r.get("format", "")).upper() == "ZIP" or str(r.get("path", "")).lower().endswith(".zip")
-        ]
-        if not zip_resources:
-            raise RuntimeError(f"У datapackage немає ZIP-ресурсу: {datapackage_url}")
-
-        resource = zip_resources[0]
-        path = resource.get("path", "")
-        name = resource.get("name", "")
-
-        if not path:
-            raise RuntimeError(f"У ресурсі немає path: {datapackage_url}")
-
-        return {
-            "dataset_title": data.get("title", ""),
-            "resource_name": name or "datapackage_resource",
-            "resource_path": path,
-            "used_fallback": False,
-        }
-
-    except Exception as e:
-        print(f"Datapackage unavailable, using fallback ZIP URL: {e}")
-        return {
-            "dataset_title": "ERB fallback resource",
-            "resource_name": "fallback_zip",
-            "resource_path": fallback_zip_url,
+        print(f"Trying old direct fallback ZIP URL: {ERB_FALLBACK_ZIP_URL}")
+        fallback_resource = {
+            "dataset_title": "ERB direct fallback resource",
+            "resource_name": ERB_FALLBACK_ZIP_URL.rstrip('/').split('/')[-1],
+            "resource_path": ERB_FALLBACK_ZIP_URL,
             "used_fallback": True,
+            "fallback_source": "direct_data_gov_zip",
         }
+        fetch_to_file(fallback_resource["resource_path"], target_path)
+        return fallback_resource
+    except Exception as e:
+        last_error = e
+        print(f"Old direct fallback ZIP failed: {e}")
+
+    print("Trying NAIS page fallback...")
+    nais_resource = resolve_resource_from_nais_page(ERB_NAIS_PAGE_URL)
+    print(f"NAIS resource: {nais_resource['resource_name']}")
+    print(f"NAIS ZIP URL: {nais_resource['resource_path']}")
+    fetch_to_file(nais_resource["resource_path"], target_path)
+    return nais_resource
 
 
 def decode_bytes(raw_bytes: bytes):
@@ -287,6 +369,7 @@ def load_watchlist(path: Path):
     print(f"Loaded watchlist rows: {len(active)} active")
     return active
 
+
 def build_watchlist_index(watchlist: list) -> dict:
     index = {
         "company_by_code": {},
@@ -326,10 +409,11 @@ def build_watchlist_index(watchlist: list) -> dict:
 
     return index
 
+
 def match_watchlist_indexed(row: dict, watchlist_index: dict):
-    row_name = normalize_text(row.get("DEBTOR_NAME", ""))
-    row_code = normalize_code(row.get("DEBTOR_CODE", ""))
-    row_birthdate = normalize_birthdate(row.get("DEBTOR_BIRTHDATE", ""))
+    row_name = normalize_text(pick_field(row, "DEBTOR_NAME"))
+    row_code = normalize_code(pick_field(row, "DEBTOR_CODE"))
+    row_birthdate = normalize_birthdate(pick_field(row, "DEBTOR_BIRTHDATE", "BIRTHDATE"))
 
     matches = []
     matched_ids = set()
@@ -341,23 +425,19 @@ def match_watchlist_indexed(row: dict, watchlist_index: dict):
         matched_ids.add(key)
         matches.append((w, strength))
 
-    # 1. Юрособи: strong match по коду
     if row_code:
         for w in watchlist_index["company_by_code"].get(row_code, []):
             add_match(w, "strong")
 
-    # 2. Юрособи: weak match по точній нормалізованій назві
     if row_name:
         for w in watchlist_index["company_by_name"].get(row_name, []):
             add_match(w, "weak")
 
-    # 3. Фізособи: strong match по ПІБ + дата народження
     if row_name and row_birthdate:
         person_key = f"{row_name}|{row_birthdate}"
         for w in watchlist_index["person_by_name_birthdate"].get(person_key, []):
             add_match(w, "strong")
 
-    # 4. Фізособи: weak match по ПІБ, якщо дата народження відсутня з одного боку
     if row_name:
         for w in watchlist_index["person_by_name"].get(row_name, []):
             w_birthdate = w.get("birthdate", "")
@@ -380,17 +460,17 @@ def build_erb_record(watchlist_item: dict, match_strength: str, row: dict, sourc
     record = {
         "watchlist_id": watchlist_item["id"],
         "match_strength": match_strength,
-        "debtor_name": row.get("DEBTOR_NAME", "").strip(),
-        "debtor_birthdate": normalize_birthdate(row.get("DEBTOR_BIRTHDATE", "")),
-        "debtor_code": normalize_code(row.get("DEBTOR_CODE", "")),
-        "publisher": row.get("PUBLISHER", "").strip(),
-        "org_name": row.get("ORG_NAME", "").strip(),
-        "org_phone_num": row.get("ORG_PHONE_NUM", "").strip(),
-        "emp_full_fio": row.get("EMP_FULL_FIO", "").strip(),
-        "emp_phone_num": row.get("EMP_PHONE_NUM", "").strip(),
-        "email_addr": row.get("EMAIL_ADDR", "").strip(),
-        "vp_ordernum": row.get("VP_ORDERNUM", "").strip(),
-        "vd_cat": row.get("VD_CAT", "").strip(),
+        "debtor_name": pick_field(row, "DEBTOR_NAME"),
+        "debtor_birthdate": normalize_birthdate(pick_field(row, "DEBTOR_BIRTHDATE", "BIRTHDATE")),
+        "debtor_code": normalize_code(pick_field(row, "DEBTOR_CODE")),
+        "publisher": pick_field(row, "PUBLISHER"),
+        "org_name": pick_field(row, "ORG_NAME", "EMP_ORG"),
+        "org_phone_num": pick_field(row, "ORG_PHONE_NUM", "ORG_PHONE"),
+        "emp_full_fio": pick_field(row, "EMP_FULL_FIO"),
+        "emp_phone_num": pick_field(row, "EMP_PHONE_NUM"),
+        "email_addr": pick_field(row, "EMAIL_ADDR"),
+        "vp_ordernum": pick_field(row, "VP_ORDERNUM", "VP_ORDER_NUM"),
+        "vd_cat": pick_field(row, "VD_CAT"),
         "source_date": source_date,
         "row_hash": "",
         "first_seen": source_date,
@@ -452,10 +532,12 @@ def process_erb(zip_path: Path, watchlist: list, source_date: str, resource_meta
         "notes": (
             f"dataset_title={resource_meta.get('dataset_title', '')}; "
             f"resource_name={resource_meta.get('resource_name', '')}; "
+            f"resource_path={resource_meta.get('resource_path', '')}; "
             f"encoding={meta['encoding']}; "
             f"csv_name={meta['csv_name']}; "
             f"header_delim=; ; row_delim=,; "
-            f"used_fallback={resource_meta.get('used_fallback', False)}"
+            f"used_fallback={resource_meta.get('used_fallback', False)}; "
+            f"fallback_source={resource_meta.get('fallback_source', '')}"
         ),
     }
 
@@ -472,21 +554,11 @@ def main():
 
     source_date = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-    print("Resolving datapackage for ERB...")
-    erb_resource = resolve_resource_from_datapackage(
-        ERB_DATAPACKAGE_URL,
-        ERB_FALLBACK_ZIP_URL
-    )
-    print(f"ERB resource: {erb_resource['resource_name']}")
-    print(f"ERB ZIP URL: {erb_resource['resource_path']}")
+    erb_resource = download_erb_zip(ERB_ZIP_PATH)
+    print(f"Final ERB resource: {erb_resource['resource_name']}")
+    print(f"Final ERB ZIP URL: {erb_resource['resource_path']}")
     print(f"Used fallback: {erb_resource['used_fallback']}")
-
-    print("Downloading ERB ZIP...")
-    fetch_to_file_with_fallback(
-        erb_resource["resource_path"],
-        ERB_FALLBACK_ZIP_URL,
-        ERB_ZIP_PATH
-    )
+    print(f"Fallback source: {erb_resource.get('fallback_source', '')}")
 
     print("Filtering ERB...")
     erb_rows, erb_tech = process_erb(ERB_ZIP_PATH, watchlist, source_date, erb_resource)
