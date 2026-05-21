@@ -178,45 +178,79 @@ def resolve_resource_from_nais_page(page_url: str) -> dict:
     html = fetch_text(page_url, retries=4, timeout=120)
     html = unescape(html)
 
-    hrefs = re.findall(r'href=["\']([^"\']+)["\']', html, flags=re.IGNORECASE)
+    candidates: list[tuple[str, str]] = []
 
-    candidates = []
-    for href in hrefs:
-        full_url = urljoin(page_url, href)
-        lower = full_url.lower()
+    # 1. Найкращий варіант: текст лінка містить ex_csv_erb.zip
+    anchor_pattern = re.compile(
+        r'<a[^>]+href=["\']([^"\']+\.zip[^"\']*)["\'][^>]*>\s*([^<]+)\s*</a>',
+        flags=re.IGNORECASE | re.DOTALL,
+    )
 
-        if "ex_csv_erb.zip" in lower and "struct" not in lower:
-            candidates.append(full_url)
+    for href, text in anchor_pattern.findall(html):
+        full_url = urljoin(page_url, href.strip())
+        text_norm = " ".join(text.strip().split()).lower()
 
+        if "ex_csv_erb.zip" in text_norm and "struct" not in text_norm:
+            candidates.append((full_url, text.strip()))
+
+    # 2. Резерв: беремо ZIP із блоку "гіперпосилання на набір даних"
     if not candidates:
-        text_candidates = re.findall(
-            r'https?://[^\s"\'<>]+ex_csv_erb\.zip',
-            html,
+        block_pattern = re.compile(
+            r'гіперпосилання\s+на\s+набір\s+даних.*?<a[^>]+href=["\']([^"\']+\.zip[^"\']*)["\'][^>]*>\s*([^<]+)\s*</a>',
+            flags=re.IGNORECASE | re.DOTALL,
+        )
+
+        for href, text in block_pattern.findall(html):
+            full_url = urljoin(page_url, href.strip())
+            text_norm = " ".join(text.strip().split()).lower()
+
+            if "struct" not in text_norm:
+                candidates.append((full_url, text.strip()))
+
+    # 3. Резерв: шукаємо будь-який ZIP з files/general, крім structure
+    if not candidates:
+        generic_zip_pattern = re.compile(
+            r'href=["\']([^"\']*files/general/[^"\']+\.zip[^"\']*)["\']',
             flags=re.IGNORECASE,
         )
-        candidates.extend(text_candidates)
 
-    unique = []
+        for href in generic_zip_pattern.findall(html):
+            full_url = urljoin(page_url, href.strip())
+            lower = full_url.lower()
+
+            if "struct" in lower:
+                continue
+
+            candidates.append((full_url, full_url.rstrip("/").split("/")[-1]))
+
+    unique: list[tuple[str, str]] = []
     seen = set()
-    for url in candidates:
-        if url not in seen:
-            seen.add(url)
-            unique.append(url)
+    for href, text in candidates:
+        if href not in seen:
+            seen.add(href)
+            unique.append((href, text))
 
     if not unique:
         raise RuntimeError(f"На сторінці NAIS не знайдено актуального ZIP для ЄРБ: {page_url}")
 
-    def score(url: str) -> tuple[int, int]:
-        m = re.search(r'(\d+)-ex_csv_erb\.zip', url, flags=re.IGNORECASE)
-        prefix_num = int(m.group(1)) if m else -1
-        return (prefix_num, -len(url))
+    def score(item: tuple[str, str]) -> tuple[int, int]:
+        href, text = item
+        text_l = text.lower()
+        href_l = href.lower()
 
-    best_url = sorted(unique, key=score, reverse=True)[0]
-    best_name = best_url.rstrip("/").split("/")[-1]
+        score_main = 0
+        if "ex_csv_erb.zip" in text_l and "struct" not in text_l:
+            score_main += 100
+        if "struct" in text_l or "struct" in href_l:
+            score_main -= 1000
+
+        return (score_main, -len(href))
+
+    best_url, best_text = sorted(unique, key=score, reverse=True)[0]
 
     return {
         "dataset_title": "Єдиний реєстр боржників (NAIS page fallback)",
-        "resource_name": best_name,
+        "resource_name": best_text or best_url.rstrip("/").split("/")[-1],
         "resource_path": best_url,
         "used_fallback": True,
         "fallback_source": "nais_page",
@@ -500,7 +534,7 @@ def process_erb(zip_path: Path, watchlist: list, source_date: str, resource_meta
 
     print(
         f"Processing ERB: csv_name={meta['csv_name']}, "
-        f"encoding={meta['encoding']}, header_delim=';', row_delim=','"
+        f"encoding={meta['encoding']}, header_delim=';'; row_delim=','"
     )
     print("HEADER:", meta["header"])
 
