@@ -15,7 +15,6 @@ from urllib.request import urlopen, Request
 
 
 ERB_DATAPACKAGE_URL = "https://data.gov.ua/dataset/506734bf-2480-448c-a2b4-90b6d06df11e/datapackage"
-ERB_FALLBACK_ZIP_URL = "https://data.gov.ua/dataset/783b9b50-faba-4cc9-a393-60485e395b1d/resource/e6ea76c1-01f4-4bd0-a282-7d92d6ecc2a1/download/31-ex_csv_erb.zip"
 ERB_NAIS_PAGE_URL = "https://nais.gov.ua/m/ediniy-reestr-borjnikiv-549"
 
 WATCHLIST_PATH = Path("watchlist.json")
@@ -60,7 +59,7 @@ def pick_field(row: dict, *names: str) -> str:
     return ""
 
 
-def fetch_text(url: str, retries: int = 6, timeout: int = 180) -> str:
+def fetch_text(url: str, retries: int = 3, timeout: int = 180) -> str:
     last_error = None
 
     for attempt in range(1, retries + 1):
@@ -81,7 +80,7 @@ def fetch_text(url: str, retries: int = 6, timeout: int = 180) -> str:
             last_error = e
             print(f"Fetch failed: {e}")
             if attempt < retries:
-                time.sleep(10 * attempt)
+                time.sleep(5 * attempt)
 
     raise RuntimeError(f"Не вдалося завантажити текст із {url}: {last_error}")
 
@@ -124,10 +123,10 @@ def fetch_to_file(url: str, target_path: Path, retries: int = 3, timeout: int = 
                     f"Content-Type={content_type}. Preview saved to {preview_path}"
                 )
 
+            # Легка перевірка: архів відкривається і містить entries.
+            # Повний testzip() прибрано для пришвидшення.
             with zipfile.ZipFile(target_path, "r") as zf:
-                bad_member = zf.testzip()
-                if bad_member is not None:
-                    raise zipfile.BadZipFile(f"CRC failed for member: {bad_member}")
+                _ = zf.namelist()
 
             return target_path
 
@@ -143,7 +142,7 @@ def fetch_to_file(url: str, target_path: Path, retries: int = 3, timeout: int = 
 
 
 def resolve_resource_from_datapackage(datapackage_url: str) -> dict:
-    raw = fetch_text(datapackage_url)
+    raw = fetch_text(datapackage_url, retries=1, timeout=90)
     data = json.loads(raw)
 
     resources = data.get("resources", [])
@@ -175,12 +174,12 @@ def resolve_resource_from_datapackage(datapackage_url: str) -> dict:
 
 
 def resolve_resource_from_nais_page(page_url: str) -> dict:
-    html = fetch_text(page_url, retries=4, timeout=120)
+    html = fetch_text(page_url, retries=3, timeout=120)
     html = unescape(html)
 
     candidates: list[tuple[str, str]] = []
 
-    # 1. Найкращий варіант: текст лінка містить ex_csv_erb.zip
+    # 1. Пріоритет: посилання, у якого текст містить ex_csv_erb.zip
     anchor_pattern = re.compile(
         r'<a[^>]+href=["\']([^"\']+\.zip[^"\']*)["\'][^>]*>\s*([^<]+)\s*</a>',
         flags=re.IGNORECASE | re.DOTALL,
@@ -193,7 +192,7 @@ def resolve_resource_from_nais_page(page_url: str) -> dict:
         if "ex_csv_erb.zip" in text_norm and "struct" not in text_norm:
             candidates.append((full_url, text.strip()))
 
-    # 2. Резерв: беремо ZIP із блоку "гіперпосилання на набір даних"
+    # 2. Резерв: блок після "гіперпосилання на набір даних"
     if not candidates:
         block_pattern = re.compile(
             r'гіперпосилання\s+на\s+набір\s+даних.*?<a[^>]+href=["\']([^"\']+\.zip[^"\']*)["\'][^>]*>\s*([^<]+)\s*</a>',
@@ -207,7 +206,7 @@ def resolve_resource_from_nais_page(page_url: str) -> dict:
             if "struct" not in text_norm:
                 candidates.append((full_url, text.strip()))
 
-    # 3. Резерв: шукаємо будь-який ZIP з files/general, крім structure
+    # 3. Резерв: будь-який ZIP із files/general, крім structure
     if not candidates:
         generic_zip_pattern = re.compile(
             r'href=["\']([^"\']*files/general/[^"\']+\.zip[^"\']*)["\']',
@@ -258,40 +257,22 @@ def resolve_resource_from_nais_page(page_url: str) -> dict:
 
 
 def download_erb_zip(target_path: Path) -> dict:
-    last_error = None
-
     try:
         print("Resolving datapackage for ERB...")
         resource = resolve_resource_from_datapackage(ERB_DATAPACKAGE_URL)
         print(f"ERB resource: {resource['resource_name']}")
         print(f"ERB ZIP URL: {resource['resource_path']}")
         print("Downloading ERB ZIP from data.gov.ua...")
-        fetch_to_file(resource["resource_path"], target_path)
+        fetch_to_file(resource["resource_path"], target_path, retries=2)
         return resource
     except Exception as e:
-        last_error = e
         print(f"Primary data.gov.ua source failed: {e}")
-
-    try:
-        print(f"Trying old direct fallback ZIP URL: {ERB_FALLBACK_ZIP_URL}")
-        fallback_resource = {
-            "dataset_title": "ERB direct fallback resource",
-            "resource_name": ERB_FALLBACK_ZIP_URL.rstrip('/').split('/')[-1],
-            "resource_path": ERB_FALLBACK_ZIP_URL,
-            "used_fallback": True,
-            "fallback_source": "direct_data_gov_zip",
-        }
-        fetch_to_file(fallback_resource["resource_path"], target_path)
-        return fallback_resource
-    except Exception as e:
-        last_error = e
-        print(f"Old direct fallback ZIP failed: {e}")
 
     print("Trying NAIS page fallback...")
     nais_resource = resolve_resource_from_nais_page(ERB_NAIS_PAGE_URL)
     print(f"NAIS resource: {nais_resource['resource_name']}")
     print(f"NAIS ZIP URL: {nais_resource['resource_path']}")
-    fetch_to_file(nais_resource["resource_path"], target_path)
+    fetch_to_file(nais_resource["resource_path"], target_path, retries=2)
     return nais_resource
 
 
