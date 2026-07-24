@@ -18,6 +18,7 @@ ERB_DATAPACKAGE_URL = (
     "https://data.gov.ua/dataset/"
     "506734bf-2480-448c-a2b4-90b6d06df11e/datapackage"
 )
+
 ERB_NAIS_PAGE_URL = (
     "https://nais.gov.ua/m/ediniy-reestr-borjnikiv-549"
 )
@@ -50,11 +51,27 @@ EXPECTED_ERB_HEADER_FIELDS = {
     "ORG_NAME",
     "ORG_PHONE",
     "ORG_PHONE_NUM",
+    "EMP_PHONE_NUM",
     "EMAIL_ADDR",
     "VP_ORDERNUM",
     "VP_ORDER_NUM",
     "VD_CAT",
 }
+
+# Мінімальні поля, без яких набір не можна вважати ЄРБ.
+REQUIRED_ERB_BASE_FIELDS = {
+    "DEBTOR_NAME",
+    "VP_ORDERNUM",
+}
+
+# Характерні поля ЄРБ, яких немає у звичайному наборі АСВП.
+ERB_IDENTITY_FIELDS = {
+    "PUBLISHER",
+    "EMP_FULL_FIO",
+    "VD_CAT",
+}
+
+MIN_ERB_IDENTITY_FIELDS = 2
 
 
 def normalize_text(value: str) -> str:
@@ -104,6 +121,10 @@ def pick_field(row: dict, *names: str) -> str:
     return ""
 
 
+def describe_error(error: Exception) -> str:
+    return f"{type(error).__name__}: {error}"
+
+
 def fetch_text(
     url: str,
     retries: int = 3,
@@ -118,7 +139,7 @@ def fetch_text(
                 f"(attempt {attempt}/{retries}): {url}"
             )
 
-            req = Request(
+            request = Request(
                 url,
                 headers={
                     "User-Agent": "Mozilla/5.0",
@@ -127,8 +148,9 @@ def fetch_text(
                 },
             )
 
-            with urlopen(req, timeout=timeout) as response:
+            with urlopen(request, timeout=timeout) as response:
                 raw = response.read()
+
                 return raw.decode(
                     "utf-8",
                     errors="replace",
@@ -136,7 +158,7 @@ def fetch_text(
 
         except Exception as error:
             last_error = error
-            print(f"Fetch failed: {error}")
+            print(f"Fetch failed: {describe_error(error)}")
 
             if attempt < retries:
                 time.sleep(5 * attempt)
@@ -162,7 +184,7 @@ def fetch_to_file(
                 f"(attempt {attempt}/{retries}): {url}"
             )
 
-            req = Request(
+            request = Request(
                 url,
                 headers={
                     "User-Agent": "Mozilla/5.0",
@@ -171,13 +193,14 @@ def fetch_to_file(
                 },
             )
 
-            with urlopen(req, timeout=timeout) as response:
+            with urlopen(request, timeout=timeout) as response:
                 content_type = response.headers.get(
                     "Content-Type",
                     "",
                 )
 
                 print(f"Content-Type: {content_type}")
+
                 data = response.read()
 
             with open(target_path, "wb") as output_file:
@@ -209,9 +232,9 @@ def fetch_to_file(
                     f"Preview saved to {preview_path}"
                 )
 
-            # Легка перевірка ZIP без повного testzip().
-            # Якщо архів пошкоджений настільки, що його неможливо
-            # прочитати, помилка виникне тут або під час читання CSV.
+            # Легка перевірка ZIP.
+            # Повний testzip() не запускаємо, щоб не читати
+            # весь великий архів додатковий раз.
             with zipfile.ZipFile(target_path, "r") as archive:
                 entries = archive.namelist()
 
@@ -220,11 +243,21 @@ def fetch_to_file(
                         "Завантажений ZIP-архів порожній"
                     )
 
+            print(
+                f"ZIP downloaded successfully: "
+                f"path={target_path}; "
+                f"size_bytes={target_path.stat().st_size}"
+            )
+
             return target_path
 
         except Exception as error:
             last_error = error
-            print(f"Download failed: {error}")
+
+            print(
+                f"Download failed: "
+                f"{describe_error(error)}"
+            )
 
             if target_path.exists():
                 target_path.unlink(missing_ok=True)
@@ -241,7 +274,7 @@ def fetch_to_file(
 def resolve_resource_from_datapackage(
     datapackage_url: str,
 ) -> dict:
-    # Лише одна спроба для data.gov.ua/datapackage.
+    # Лише одна спроба отримання datapackage.
     raw = fetch_text(
         datapackage_url,
         retries=1,
@@ -293,6 +326,7 @@ def resolve_resource_from_datapackage(
         "resource_path": path,
         "used_fallback": False,
         "fallback_source": "",
+        "fallback_reason": "",
     }
 
 
@@ -304,6 +338,7 @@ def resolve_resource_from_nais_page(
         retries=3,
         timeout=120,
     )
+
     html = unescape(html)
 
     candidates: list[tuple[str, str]] = []
@@ -327,6 +362,7 @@ def resolve_resource_from_nais_page(
         clean_text = " ".join(
             text.strip().split()
         )
+
         text_normalized = clean_text.lower()
 
         if (
@@ -334,7 +370,10 @@ def resolve_resource_from_nais_page(
             and "struct" not in text_normalized
         ):
             candidates.append(
-                (full_url, clean_text)
+                (
+                    full_url,
+                    clean_text,
+                )
             )
 
     # 2. Резерв:
@@ -358,11 +397,15 @@ def resolve_resource_from_nais_page(
             clean_text = " ".join(
                 text.strip().split()
             )
+
             text_normalized = clean_text.lower()
 
             if "struct" not in text_normalized:
                 candidates.append(
-                    (full_url, clean_text)
+                    (
+                        full_url,
+                        clean_text,
+                    )
                 )
 
     # 3. Додатковий резерв:
@@ -399,8 +442,12 @@ def resolve_resource_from_nais_page(
             continue
 
         seen_urls.add(href)
+
         unique_candidates.append(
-            (href, text)
+            (
+                href,
+                text,
+            )
         )
 
     if not unique_candidates:
@@ -454,7 +501,47 @@ def resolve_resource_from_nais_page(
         "resource_path": best_url,
         "used_fallback": True,
         "fallback_source": "nais_page",
+        "fallback_reason": "",
     }
+
+
+def download_nais_erb_zip(
+    target_path: Path,
+    fallback_reason: str,
+) -> dict:
+    print("Trying NAIS page fallback...")
+
+    if target_path.exists():
+        target_path.unlink(missing_ok=True)
+
+    nais_resource = resolve_resource_from_nais_page(
+        ERB_NAIS_PAGE_URL
+    )
+
+    nais_resource["fallback_reason"] = fallback_reason
+
+    print(
+        f"NAIS resource: "
+        f"{nais_resource['resource_name']}"
+    )
+
+    print(
+        f"NAIS ZIP URL: "
+        f"{nais_resource['resource_path']}"
+    )
+
+    print(
+        f"NAIS fallback reason: "
+        f"{fallback_reason}"
+    )
+
+    fetch_to_file(
+        nais_resource["resource_path"],
+        target_path,
+        retries=2,
+    )
+
+    return nais_resource
 
 
 def download_erb_zip(
@@ -471,10 +558,12 @@ def download_erb_zip(
             f"ERB resource: "
             f"{resource['resource_name']}"
         )
+
         print(
             f"ERB ZIP URL: "
             f"{resource['resource_path']}"
         )
+
         print(
             "Downloading ERB ZIP from data.gov.ua..."
         )
@@ -488,35 +577,20 @@ def download_erb_zip(
         return resource
 
     except Exception as error:
+        error_description = describe_error(error)
+
         print(
             "Primary data.gov.ua source failed: "
-            f"{error}"
+            f"{error_description}"
         )
 
-    # Старий прямий ZIP data.gov.ua не використовується.
-    # Після збою одразу переходимо на NAIS.
-    print("Trying NAIS page fallback...")
-
-    nais_resource = resolve_resource_from_nais_page(
-        ERB_NAIS_PAGE_URL
-    )
-
-    print(
-        f"NAIS resource: "
-        f"{nais_resource['resource_name']}"
-    )
-    print(
-        f"NAIS ZIP URL: "
-        f"{nais_resource['resource_path']}"
-    )
-
-    fetch_to_file(
-        nais_resource["resource_path"],
-        target_path,
-        retries=2,
-    )
-
-    return nais_resource
+        return download_nais_erb_zip(
+            target_path=target_path,
+            fallback_reason=(
+                "primary_download_failed: "
+                f"{error_description}"
+            ),
+        )
 
 
 def decode_bytes(
@@ -530,6 +604,7 @@ def decode_bytes(
                 raw_bytes.decode(encoding),
                 encoding,
             )
+
         except Exception as error:
             last_error = error
 
@@ -579,6 +654,7 @@ def detect_header_delimiter(
                 header_line,
                 delimiter,
             )
+
         except csv.Error:
             continue
 
@@ -661,7 +737,11 @@ def detect_row_delimiter(
                     line,
                     delimiter,
                 )
-                row_lengths.append(len(parsed))
+
+                row_lengths.append(
+                    len(parsed)
+                )
+
             except csv.Error:
                 row_lengths.append(0)
 
@@ -707,34 +787,112 @@ def detect_row_delimiter(
     )
 
 
+def select_erb_csv_name(
+    archive: zipfile.ZipFile,
+) -> str:
+    csv_names = [
+        name
+        for name in archive.namelist()
+        if name.lower().endswith(".csv")
+    ]
+
+    if not csv_names:
+        raise RuntimeError(
+            "У ZIP не знайдено жодного CSV"
+        )
+
+    preferred_names = [
+        name
+        for name in csv_names
+        if (
+            "erb" in Path(name).name.lower()
+            and "asvp" not in Path(name).name.lower()
+            and "struct" not in Path(name).name.lower()
+        )
+    ]
+
+    candidates = (
+        preferred_names
+        if preferred_names
+        else csv_names
+    )
+
+    return max(
+        candidates,
+        key=lambda name: archive.getinfo(
+            name
+        ).file_size,
+    )
+
+
+def validate_erb_csv_identity(
+    csv_name: str,
+    header: list[str],
+) -> None:
+    csv_basename = Path(csv_name).name.lower()
+
+    if "asvp" in csv_basename:
+        raise RuntimeError(
+            "У ZIP замість набору ЄРБ знайдено "
+            f"CSV набору АСВП: {csv_name}"
+        )
+
+    if "struct" in csv_basename:
+        raise RuntimeError(
+            "У ZIP знайдено файл структури "
+            f"замість набору даних ЄРБ: {csv_name}"
+        )
+
+    header_set = set(header)
+
+    missing_base_fields = (
+        REQUIRED_ERB_BASE_FIELDS - header_set
+    )
+
+    if missing_base_fields:
+        raise RuntimeError(
+            "CSV не відповідає базовій структурі ЄРБ. "
+            f"Відсутні обов'язкові поля: "
+            f"{sorted(missing_base_fields)}. "
+            f"CSV={csv_name}; Header={header}"
+        )
+
+    identity_fields_found = (
+        ERB_IDENTITY_FIELDS & header_set
+    )
+
+    if (
+        len(identity_fields_found)
+        < MIN_ERB_IDENTITY_FIELDS
+    ):
+        raise RuntimeError(
+            "CSV не вдалося підтвердити як набір ЄРБ. "
+            "Недостатньо характерних полів ЄРБ. "
+            f"Знайдено: {sorted(identity_fields_found)}; "
+            f"очікуються щонайменше "
+            f"{MIN_ERB_IDENTITY_FIELDS} із "
+            f"{sorted(ERB_IDENTITY_FIELDS)}. "
+            f"CSV={csv_name}; Header={header}"
+        )
+
+
 def parse_erb_layout_from_zip(
     zip_path: Path,
 ) -> dict:
     with zipfile.ZipFile(zip_path, "r") as archive:
-        csv_names = [
-            name
-            for name in archive.namelist()
-            if name.lower().endswith(".csv")
-        ]
-
-        if not csv_names:
-            raise RuntimeError(
-                f"У ZIP не знайдено CSV: {zip_path}"
-            )
-
-        csv_name = max(
-            csv_names,
-            key=lambda name: archive.getinfo(
-                name
-            ).file_size,
+        csv_name = select_erb_csv_name(
+            archive
         )
 
         with archive.open(csv_name) as source_file:
-            raw_bytes = source_file.read(300_000)
+            raw_bytes = source_file.read(
+                300_000
+            )
 
     text, encoding_used = decode_bytes(
         raw_bytes
     )
+
     lines = text.splitlines()
 
     if len(lines) < 2:
@@ -763,6 +921,11 @@ def parse_erb_layout_from_zip(
         header_line
     )
 
+    validate_erb_csv_identity(
+        csv_name=csv_name,
+        header=header,
+    )
+
     header_len = len(header)
 
     (
@@ -776,6 +939,7 @@ def parse_erb_layout_from_zip(
 
     print(
         "ERB layout confirmed: "
+        f"csv_name={csv_name}; "
         f"header_delim={repr(header_delimiter)}; "
         f"row_delim={repr(row_delimiter)}; "
         f"header_len={header_len}; "
@@ -832,7 +996,9 @@ def iter_erb_rows_from_zip(
 
                 if len(row) < header_len:
                     row = row + (
-                        [""] * (header_len - len(row))
+                        [""] * (
+                            header_len - len(row)
+                        )
                     )
 
                 elif len(row) > header_len:
@@ -851,7 +1017,9 @@ def iter_erb_rows_from_zip(
                         if row[index] is None
                         else str(row[index])
                     )
-                    for index in range(header_len)
+                    for index in range(
+                        header_len
+                    )
                 }
 
 
@@ -931,14 +1099,17 @@ def build_watchlist_index(
             "entity_type",
             "",
         )
+
         name = watchlist_item.get(
             "debtor_name_norm",
             "",
         )
+
         code = watchlist_item.get(
             "debtor_code",
             "",
         )
+
         birthdate = watchlist_item.get(
             "birthdate",
             "",
@@ -1038,7 +1209,7 @@ def match_watchlist_indexed(
             )
         )
 
-    # 1. Юридичні особи: код.
+    # 1. Юридичні особи: strong match за кодом.
     if row_code:
         for watchlist_item in watchlist_index[
             "company_by_code"
@@ -1048,7 +1219,7 @@ def match_watchlist_indexed(
                 "strong",
             )
 
-    # 2. Юридичні особи: точна нормалізована назва.
+    # 2. Юридичні особи: weak match за назвою.
     if row_name:
         for watchlist_item in watchlist_index[
             "company_by_name"
@@ -1058,7 +1229,8 @@ def match_watchlist_indexed(
                 "weak",
             )
 
-    # 3. Фізичні особи: ПІБ + дата народження.
+    # 3. Фізичні особи: strong match
+    # за ПІБ та датою народження.
     if row_name and row_birthdate:
         person_key = (
             f"{row_name}|{row_birthdate}"
@@ -1072,8 +1244,8 @@ def match_watchlist_indexed(
                 "strong",
             )
 
-    # 4. Фізичні особи: ПІБ, якщо дата відсутня
-    # хоча б з одного боку.
+    # 4. Фізичні особи: weak match за ПІБ,
+    # якщо дата відсутня хоча б з одного боку.
     if row_name:
         for watchlist_item in watchlist_index[
             "person_by_name"
@@ -1187,7 +1359,9 @@ def build_erb_record(
         "is_active": "true",
     }
 
-    record["row_hash"] = stable_hash(record)
+    record["row_hash"] = stable_hash(
+        record
+    )
 
     return record
 
@@ -1283,6 +1457,11 @@ def process_erb(
                 )
             )
 
+    if scanned == 0:
+        raise RuntimeError(
+            "CSV ЄРБ не містить жодного рядка даних"
+        )
+
     matches = dedupe_records(
         matches
     )
@@ -1309,13 +1488,44 @@ def process_erb(
             f"used_fallback="
             f"{resource_meta.get('used_fallback', False)}; "
             f"fallback_source="
-            f"{resource_meta.get('fallback_source', '')}"
+            f"{resource_meta.get('fallback_source', '')}; "
+            f"fallback_reason="
+            f"{resource_meta.get('fallback_reason', '')}"
         ),
     }
 
     return (
         matches,
         tech_row,
+    )
+
+
+def print_resource_info(
+    resource: dict,
+) -> None:
+    print(
+        f"Final ERB resource: "
+        f"{resource.get('resource_name', '')}"
+    )
+
+    print(
+        f"Final ERB ZIP URL: "
+        f"{resource.get('resource_path', '')}"
+    )
+
+    print(
+        f"Used fallback: "
+        f"{resource.get('used_fallback', False)}"
+    )
+
+    print(
+        f"Fallback source: "
+        f"{resource.get('fallback_source', '')}"
+    )
+
+    print(
+        f"Fallback reason: "
+        f"{resource.get('fallback_reason', '')}"
     )
 
 
@@ -1345,31 +1555,86 @@ def main():
         ERB_ZIP_PATH
     )
 
-    print(
-        f"Final ERB resource: "
-        f"{erb_resource['resource_name']}"
-    )
-    print(
-        f"Final ERB ZIP URL: "
-        f"{erb_resource['resource_path']}"
-    )
-    print(
-        f"Used fallback: "
-        f"{erb_resource['used_fallback']}"
-    )
-    print(
-        f"Fallback source: "
-        f"{erb_resource.get('fallback_source', '')}"
+    print_resource_info(
+        erb_resource
     )
 
     print("Filtering ERB...")
 
-    erb_rows, erb_tech = process_erb(
-        ERB_ZIP_PATH,
-        watchlist,
-        source_date,
-        erb_resource,
-    )
+    try:
+        erb_rows, erb_tech = process_erb(
+            ERB_ZIP_PATH,
+            watchlist,
+            source_date,
+            erb_resource,
+        )
+
+    except Exception as primary_process_error:
+        primary_error_description = describe_error(
+            primary_process_error
+        )
+
+        # Якщо ми вже працювали з NAIS, повторно fallback
+        # не запускаємо, щоб уникнути нескінченного циклу.
+        if (
+            erb_resource.get("fallback_source")
+            == "nais_page"
+        ):
+            raise RuntimeError(
+                "Джерело NAIS не вдалося "
+                "перевірити або обробити: "
+                f"{primary_error_description}"
+            ) from primary_process_error
+
+        print(
+            "Primary data.gov.ua archive failed "
+            "ERB validation or processing: "
+            f"{primary_error_description}"
+        )
+
+        print(
+            "Switching to NAIS fallback "
+            "and restarting ERB processing..."
+        )
+
+        fallback_reason = (
+            "primary_validation_or_processing_failed: "
+            f"{primary_error_description}"
+        )
+
+        try:
+            erb_resource = download_nais_erb_zip(
+                target_path=ERB_ZIP_PATH,
+                fallback_reason=fallback_reason,
+            )
+
+            print_resource_info(
+                erb_resource
+            )
+
+            print(
+                "Filtering ERB from NAIS fallback..."
+            )
+
+            erb_rows, erb_tech = process_erb(
+                ERB_ZIP_PATH,
+                watchlist,
+                source_date,
+                erb_resource,
+            )
+
+        except Exception as nais_error:
+            nais_error_description = describe_error(
+                nais_error
+            )
+
+            raise RuntimeError(
+                "Не вдалося обробити жодне джерело ЄРБ. "
+                "Помилка primary data.gov.ua: "
+                f"{primary_error_description}. "
+                "Помилка NAIS fallback: "
+                f"{nais_error_description}"
+            ) from nais_error
 
     with open(
         "filtered_erb.json",
@@ -1398,6 +1663,7 @@ def main():
     print(
         f"ERB matches: {len(erb_rows)}"
     )
+
     print(
         "Saved filtered_erb.json, "
         "tech_rows.json"
